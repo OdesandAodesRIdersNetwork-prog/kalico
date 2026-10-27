@@ -3719,9 +3719,8 @@ class E3v3seDisplay:
         else:
             self.lcd.draw_rectangle(
                 1,
-                self.color_Bg_Red,
+                self.color_background_red,
                 11,
-                25,
                 self.MBASE(3) - 10,
                 self.lcd.screen_width - 10,
                 self.MBASE(4),
@@ -3730,7 +3729,7 @@ class E3v3seDisplay:
                 False,
                 self.lcd.font_16x32,
                 self.color_yellow,
-                self.color_Bg_Red,
+                self.color_background_red,
                 ((self.lcd.screen_width) - 8 * 16) / 2,
                 self.MBASE(3),
                 "No Media",
