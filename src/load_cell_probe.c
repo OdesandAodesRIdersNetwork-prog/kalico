@@ -537,9 +537,11 @@ command_load_cell_probe_query_state(uint32_t *args)
     uint8_t oid = args[0];
     struct load_cell_probe *lcp = load_cell_probe_oid_lookup(args[0]);
     sendf("load_cell_probe_state oid=%c is_homing_trigger=%c trigger_ticks=%u"
+          " trigger_source=%c"
             , oid
             , is_flag_set(FLAG_IS_HOMING_TRIGGER, lcp)
-            , lcp->trigger_ticks);
+            , lcp->trigger_ticks
+            , lcp->trigger_source);
 }
 DECL_COMMAND(command_load_cell_probe_query_state
                 , "load_cell_probe_query_state oid=%c");

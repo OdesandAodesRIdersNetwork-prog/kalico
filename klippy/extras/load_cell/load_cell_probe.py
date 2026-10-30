@@ -456,7 +456,7 @@ class McuLoadCellProbe:
         self._query_cmd = self._mcu.lookup_query_command(
             "load_cell_probe_query_state oid=%c",
             "load_cell_probe_state oid=%c is_homing_trigger=%c "
-            "trigger_ticks=%u",
+            "trigger_ticks=%u trigger_source=%c",
             oid=self._oid,
             cq=self._cmd_queue,
         )
@@ -542,6 +542,13 @@ class McuLoadCellProbe:
         params = self._query_cmd.send([self._oid])
         # The time of the first sample that triggered is in "trigger_ticks"
         trigger_ticks = self._mcu.clock32_to_clock64(params["trigger_ticks"])
+        trigger_source = params["trigger_source"]
+        self._last_trigger_source = trigger_source
+        logging.info(
+            "load_cell_probe: trigger_source=%d (%s)",
+            trigger_source,
+            {1: "prtouch", 2: "force"}.get(trigger_source, "none/unknown"),
+        )
         # clear trsync from load_cell_endstop
         self._home_cmd.send([self._oid, 0, 0, 0, 0, 0, 0, 0])
         return self._mcu.clock_to_print_time(trigger_ticks)
