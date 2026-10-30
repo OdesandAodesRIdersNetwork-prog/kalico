@@ -7,6 +7,7 @@
 # Copyright (C) 2026
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+import math
 from klippy import mcu
 from .load_cell import hx71x, ads1220, load_cell, load_cell_probe
 
@@ -685,6 +686,411 @@ class StrainGaugeZCal:
 
         return threshold_z, contact_onset_z, len(fit_points)
 
+    def _analyze_creality_contact_event(
+            self, samples, trigger_time, trigger_z, speed):
+        # Creality PRTouch V2 keeps a rolling 32-sample pressure FIFO
+        # and analyzes the final samples leading into its MCU trigger.
+        #
+        # We reproduce that event-selection concept here using Kalico's
+        # timestamped HX711 samples.  This is DIAGNOSTIC ONLY for now.
+
+        pre_trigger = []
+
+        for sample in samples:
+            sample_time = sample[0]
+            force = sample[1]
+
+            if sample_time <= trigger_time:
+                pre_trigger.append((sample_time, force))
+
+        pre_trigger.sort(key=lambda item: item[0])
+
+        if len(pre_trigger) < 8:
+            return None, len(pre_trigger), None, None
+
+        # Match Creality MAX_BUF_LEN = 32.
+        window = pre_trigger[-32:]
+
+        times = [item[0] for item in window]
+        data = [float(item[1]) for item in window]
+
+        # Creality normalizes non-ADC pressure polarity before
+        # cal_tri_data() filtering so the contact ramp always points
+        # in the expected direction.
+        if data[-1] < data[0]:
+            data = [-value for value in data]
+
+        # Creality's non-ADC cal_tri_data() first performs a
+        # three-sample minimum-absolute-value selection.
+        for i in range(len(data) - 2):
+            d3_abs = [
+                abs(data[i]),
+                abs(data[i + 1]),
+                abs(data[i + 2]),
+            ]
+            offset = d3_abs.index(min(d3_abs))
+            data[i] = data[i + offset]
+
+        # Determine the actual Kalico sample interval instead of assuming
+        # Creality's nominal 12ms interval.  V3 SE factory default
+        # cal_hftr_cut is 10Hz.
+        intervals = []
+
+        for i in range(1, len(times)):
+            dt = times[i] - times[i - 1]
+            if dt > 0.0:
+                intervals.append(dt)
+
+        if not intervals:
+            return None, len(window), None, None
+
+        intervals.sort()
+        sample_dt = intervals[len(intervals) // 2]
+
+        cal_hftr_cut = 10.0
+        rc = 1.0 / (2.0 * math.pi * cal_hftr_cut)
+        coff = rc / (rc + sample_dt)
+
+        source = list(data)
+        filtered = [0.0]
+
+        for i in range(1, len(source)):
+            filtered.append(
+                (source[i] - source[i - 1] + filtered[-1]) * coff)
+
+        # Creality non-ADC default cal_lftr_k1 = 0.85.
+        cal_lftr_k1 = 0.85
+
+        for i in range(1, len(filtered)):
+            filtered[i] = (
+                filtered[i - 1] * (1.0 - cal_lftr_k1)
+                + filtered[i] * cal_lftr_k1)
+
+        min_val = min(filtered)
+        max_val = max(filtered)
+        value_range = max_val - min_val
+
+        if abs(value_range) < 1.0e-12:
+            return None, len(window), None, None
+
+        vals = [
+            (value - min_val) / value_range
+            for value in filtered
+        ]
+
+        # Match Creality cal_tri_data() de-trend / rotation.
+        angle = math.atan(
+            (vals[-1] - vals[0]) / float(len(vals)))
+
+        sin_angle = math.sin(-angle)
+        cos_angle = math.cos(-angle)
+
+        detrended = []
+
+        for i, value in enumerate(vals):
+            detrended.append(
+                float(i) * sin_angle
+                + value * cos_angle)
+
+        event_index = detrended.index(min(detrended))
+        event_time = times[event_index]
+
+        # Same synchronized constant-speed mapping already proven in the
+        # native Kalico path.
+        event_z = (
+            trigger_z
+            + speed * (trigger_time - event_time)
+        )
+
+        before_trigger_ms = (
+            (trigger_time - event_time) * 1000.0)
+
+        return (
+            event_z,
+            len(window),
+            event_index,
+            before_trigger_ms,
+        )
+
+    def _replay_creality_mcu_trigger(
+            self, samples, trigger_time, trigger_z, probe_speed):
+        # Diagnostic replay of Creality's non-ADC PRTouch MCU trigger.
+        #
+        # This does NOT control motion.  It replays the factory
+        # 32-sample T/H/L filtering and trigger tests against the raw
+        # HX711 history collected during the existing Kalico probe.
+        #
+        # Kalico's current tare is used as the equivalent of Creality's
+        # pre-probe tri_avg_vals baseline.
+
+        history = []
+
+        try:
+            tare_counts = float(self.load_cell.get_tare_counts())
+        except Exception:
+            return None
+
+        for sample in samples:
+            sample_time = float(sample[0])
+
+            if sample_time > trigger_time:
+                continue
+
+            if len(sample) < 3:
+                continue
+
+            raw_counts = float(sample[2])
+            history.append(
+                (sample_time, raw_counts - tare_counts))
+
+        if len(history) < 32:
+            return None
+
+        tri_min_hold = 1000.0
+        tri_max_hold = 1500.0
+        tri_hftr_cut = 2.0
+        tri_lftr_k1 = 0.70
+
+        for end_index in range(31, len(history)):
+            window = history[end_index - 31:end_index + 1]
+
+            times = [item[0] for item in window]
+            data = [item[1] for item in window]
+
+            # Creality polarity normalization.
+            if data[-1] < data[0]:
+                data = [-value for value in data]
+
+            # Creality T filter:
+            # choose the smallest absolute value from each 3-sample group.
+            for i in range(0, 30):
+                a = data[i]
+                b = data[i + 1]
+                c = data[i + 2]
+
+                chosen = a if abs(a) < abs(b) else b
+
+                if abs(c) < abs(chosen):
+                    chosen = c
+
+                data[i] = chosen
+
+            # Use the actual Kalico/HX711 sample interval.
+            intervals = [
+                times[i] - times[i - 1]
+                for i in range(1, len(times))
+                if times[i] > times[i - 1]
+            ]
+
+            if intervals:
+                intervals.sort()
+                sample_dt = intervals[len(intervals) // 2]
+            else:
+                sample_dt = 0.0125
+
+            # Creality high-pass filter.
+            rc = 1.0 / (2.0 * math.pi * tri_hftr_cut)
+            coff = rc / (rc + sample_dt)
+
+            filtered = [0.0] * 32
+
+            for i in range(1, 32):
+                filtered[i] = (
+                    data[i]
+                    - data[i - 1]
+                    + filtered[i - 1]
+                ) * coff
+
+            # Creality recursive low-pass filter.
+            for i in range(1, 32):
+                filtered[i] = (
+                    filtered[i] * tri_lftr_k1
+                    + filtered[i - 1] * (1.0 - tri_lftr_k1)
+                )
+
+            p29 = filtered[29]
+            p30 = filtered[30]
+            p31 = filtered[31]
+
+            trigger_mode = None
+
+            # Factory path 1: max-hold fast trigger.
+            if (
+                    p31 > tri_max_hold
+                    and p30 > tri_max_hold / 2.0
+                    and p29 > tri_max_hold / 3.0):
+                trigger_mode = "max_hold"
+
+            # Factory path 2:
+            # rising last 3 + last 3 above all earlier points + min hold.
+            if trigger_mode is None:
+                if p31 > p30 and p30 > p29:
+                    dominates = True
+
+                    for j in range(0, 29):
+                        if not (
+                                p31 > filtered[j]
+                                and p30 > filtered[j]
+                                and p29 > filtered[j]):
+                            dominates = False
+                            break
+
+                    if dominates and p31 >= tri_min_hold:
+                        trigger_mode = "rising_min_hold"
+
+            if trigger_mode is None:
+                continue
+
+            event_time = times[-1]
+
+            # Same synchronized Z/time mapping already used by our
+            # native waveform diagnostics.
+            event_z = (
+                trigger_z
+                + probe_speed * (trigger_time - event_time)
+            )
+
+            before_trigger_ms = (
+                trigger_time - event_time
+            ) * 1000.0
+
+            return (
+                event_z,
+                trigger_mode,
+                p29,
+                p30,
+                p31,
+                sample_dt * 1000.0,
+                before_trigger_ms,
+                end_index,
+            )
+
+        return None
+
+    def _analyze_contact_quality(self, samples, trigger_time):
+        # Diagnostic only.
+        #
+        # Use relative waveform properties rather than an absolute
+        # force threshold so this can eventually generalize across
+        # different V3 SE strain gauges / HX711 scaling.
+
+        pre_trigger = []
+
+        for sample in samples:
+            sample_time = sample[0]
+            force = float(sample[1])
+
+            if sample_time <= trigger_time:
+                pre_trigger.append((sample_time, force))
+
+        pre_trigger.sort(key=lambda item: item[0])
+
+        if len(pre_trigger) < 12:
+            return None
+
+        window = pre_trigger[-32:]
+
+        times = [item[0] for item in window]
+        data = [item[1] for item in window]
+
+        # Same polarity normalization used by the Creality-style
+        # diagnostic so "contact" always rises positively.
+        if data[-1] < data[0]:
+            data = [-value for value in data]
+
+        # Estimate quiet baseline from the beginning of the history.
+        baseline_count = min(12, max(8, len(data) // 3))
+        baseline_values = sorted(data[:baseline_count])
+
+        nbase = len(baseline_values)
+
+        if nbase % 2:
+            baseline = baseline_values[nbase // 2]
+        else:
+            baseline = (
+                baseline_values[nbase // 2 - 1]
+                + baseline_values[nbase // 2]
+            ) / 2.0
+
+        deviations = sorted(
+            abs(value - baseline)
+            for value in data[:baseline_count]
+        )
+
+        ndev = len(deviations)
+
+        if ndev % 2:
+            mad = deviations[ndev // 2]
+        else:
+            mad = (
+                deviations[ndev // 2 - 1]
+                + deviations[ndev // 2]
+            ) / 2.0
+
+        # Robust sigma estimate from MAD.
+        noise_sigma = mad * 1.4826
+
+        peak_signal = max(data) - baseline
+        end_signal = data[-1] - baseline
+
+        if noise_sigma > 1.0e-9:
+            snr = end_signal / noise_sigma
+        else:
+            snr = None
+
+        last3_rising = (
+            len(data) >= 3
+            and data[-1] > data[-2] > data[-3]
+        )
+
+        dominates_history = False
+
+        if len(data) > 3:
+            earlier_max = max(data[:-3])
+            dominates_history = (
+                data[-1] > earlier_max
+                and data[-2] > earlier_max
+                and data[-3] > earlier_max
+            )
+
+        # Find when the rising waveform first exceeds baseline + 3 sigma.
+        # This is diagnostic only, not a trigger rule.
+        rise_index = None
+
+        if noise_sigma > 1.0e-9:
+            rise_level = baseline + 3.0 * noise_sigma
+
+            for i, value in enumerate(data):
+                if value >= rise_level:
+                    rise_index = i
+                    break
+
+        if rise_index is None:
+            rise_samples = 0
+            rise_ms = None
+        else:
+            rise_samples = len(data) - rise_index
+
+            if rise_index < len(times):
+                rise_ms = (
+                    trigger_time - times[rise_index]
+                ) * 1000.0
+            else:
+                rise_ms = None
+
+        return (
+            len(data),
+            baseline,
+            noise_sigma,
+            peak_signal,
+            end_signal,
+            snr,
+            last3_rising,
+            dominates_history,
+            rise_samples,
+            rise_ms,
+        )
+
     def cmd_STRAIN_GAUGE_NOZZLE_PREP(self, gcmd):
         if not self._check_homed():
             raise gcmd.error("Printer must be homed first! Run G28")
@@ -704,9 +1110,35 @@ class StrainGaugeZCal:
         wipe_relief = gcmd.get_float(
             "WIPE_RELIEF", 0.015, minval=0.0, maxval=0.10)
         passes = gcmd.get_int("PASSES", 6, minval=1, maxval=20)
+        clear_probe_count = gcmd.get_int(
+            "CLEAR_PROBE_COUNT", 3, minval=1, maxval=9)
 
         trigger_force = (
             self._native_config_helper.get_trigger_force_grams(gcmd))
+
+        # Creality clears mesh compensation while measuring the physical
+        # cleaning surface. Preserve the currently loaded saved profile
+        # and restore it before the final G28 Z.
+        bed_mesh = self.printer.lookup_object('bed_mesh', None)
+        mesh_was_active = False
+        active_profile = ""
+
+        if bed_mesh is not None:
+            mesh_status = bed_mesh.get_status(reactor.monotonic())
+            active_profile = mesh_status.get('profile_name', '')
+            mesh_matrix = mesh_status.get('mesh_matrix', [[]])
+            mesh_was_active = bool(mesh_matrix and mesh_matrix[0])
+
+            if mesh_was_active and not active_profile:
+                raise gcmd.error(
+                    "Active bed mesh has no saved profile name. "
+                    "Load a saved mesh profile before nozzle prep.")
+
+        if mesh_was_active:
+            gcmd.respond_info(
+                "Temporarily clearing bed mesh profile '%s' for nozzle prep..."
+                % active_profile)
+            self.gcode.run_script_from_command("BED_MESH_CLEAR")
 
         def probe_contact(x, y):
             toolhead.manual_move([None, None, 10.0], 10.0)
@@ -746,6 +1178,27 @@ class StrainGaugeZCal:
                     probe_speed,
                     trigger_force))
 
+            (
+                creality_z,
+                creality_count,
+                creality_index,
+                creality_before_ms,
+            ) = self._analyze_creality_contact_event(
+                samples,
+                trigger_time,
+                trigger_z,
+                probe_speed)
+
+            quality = self._analyze_contact_quality(
+                samples,
+                trigger_time)
+
+            factory_replay = self._replay_creality_mcu_trigger(
+                samples,
+                trigger_time,
+                trigger_z,
+                probe_speed)
+
             toolhead.manual_move([None, None, 5.0], 5.0)
             toolhead.wait_moves()
 
@@ -753,14 +1206,120 @@ class StrainGaugeZCal:
                 raise gcmd.error(
                     "Could not determine raw force threshold at wipe point")
 
+            if onset_z is None:
+                onset_text = "unavailable"
+            else:
+                onset_text = "%.5f" % onset_z
+
             gcmd.respond_info(
                 "Wipe-point contact X%.1f Y%.1f: "
-                "halt=%.5f raw %.1fg=%.5f"
+                "halt=%.5f raw %.1fg=%.5f onset=%s fit=%d"
                 % (
                     x, y,
                     trigger_z,
                     trigger_force,
-                    threshold_z))
+                    threshold_z,
+                    onset_text,
+                    fit_count))
+
+            if creality_z is None:
+                gcmd.respond_info(
+                    "Creality-event X%.1f Y%.1f: unavailable n=%d"
+                    % (
+                        x, y,
+                        creality_count))
+            else:
+                gcmd.respond_info(
+                    "Creality-event X%.1f Y%.1f: "
+                    "z=%.5f index=%d before_trigger=%.1fms n=%d"
+                    % (
+                        x, y,
+                        creality_z,
+                        creality_index,
+                        creality_before_ms,
+                        creality_count))
+
+            if factory_replay is None:
+                gcmd.respond_info(
+                    "Creality-MCU-replay X%.1f Y%.1f: "
+                    "NO FACTORY TRIGGER before Kalico halt"
+                    % (x, y))
+            else:
+                (
+                    factory_z,
+                    factory_mode,
+                    factory_p29,
+                    factory_p30,
+                    factory_p31,
+                    factory_dt_ms,
+                    factory_before_ms,
+                    factory_index,
+                ) = factory_replay
+
+                gcmd.respond_info(
+                    "Creality-MCU-replay X%.1f Y%.1f: "
+                    "z=%.5f mode=%s "
+                    "p29=%.1f p30=%.1f p31=%.1f "
+                    "dt=%.2fms before_75g=%.1fms index=%d"
+                    % (
+                        x,
+                        y,
+                        factory_z,
+                        factory_mode,
+                        factory_p29,
+                        factory_p30,
+                        factory_p31,
+                        factory_dt_ms,
+                        factory_before_ms,
+                        factory_index,
+                    ))
+
+            if quality is None:
+                gcmd.respond_info(
+                    "Contact-quality X%.1f Y%.1f: unavailable"
+                    % (x, y))
+            else:
+                (
+                    quality_n,
+                    baseline,
+                    noise_sigma,
+                    peak_signal,
+                    end_signal,
+                    snr,
+                    last3_rising,
+                    dominates_history,
+                    rise_samples,
+                    rise_ms,
+                ) = quality
+
+                if snr is None:
+                    snr_text = "inf/undefined"
+                else:
+                    snr_text = "%.1f" % snr
+
+                if rise_ms is None:
+                    rise_text = "unavailable"
+                else:
+                    rise_text = "%.1fms" % rise_ms
+
+                gcmd.respond_info(
+                    "Contact-quality X%.1f Y%.1f: "
+                    "n=%d baseline=%.2fg noise=%.2fg "
+                    "peak=%.2fg end=%.2fg SNR=%s "
+                    "rising3=%s dominates=%s "
+                    "rise_samples=%d rise_time=%s"
+                    % (
+                        x, y,
+                        quality_n,
+                        baseline,
+                        noise_sigma,
+                        peak_signal,
+                        end_signal,
+                        snr_text,
+                        "yes" if last3_rising else "no",
+                        "yes" if dominates_history else "no",
+                        rise_samples,
+                        rise_text))
 
             return threshold_z
 
@@ -777,10 +1336,49 @@ class StrainGaugeZCal:
         self.gcode.run_script_from_command("M190 S60")
         self.gcode.run_script_from_command("M109 S180")
 
-        # Find the bed at both wipe endpoints using the native
-        # strain probe instead of assuming bed height.
-        start_contact = probe_contact(start_x, start_y)
-        end_contact = probe_contact(start_x, end_y)
+        # Match Creality's repeated cleaning-surface probing.
+        # Default: three native contacts at each endpoint, then median.
+        def probe_contact_median(x, y):
+            contacts = []
+
+            for attempt in range(clear_probe_count):
+                contact_z = probe_contact(x, y)
+                contacts.append(contact_z)
+
+                gcmd.respond_info(
+                    "Wipe-point X%.1f Y%.1f pass %d/%d: %.5f"
+                    % (
+                        x, y,
+                        attempt + 1,
+                        clear_probe_count,
+                        contact_z))
+
+            ordered = sorted(contacts)
+            count = len(ordered)
+
+            if count % 2:
+                median_z = ordered[count // 2]
+            else:
+                median_z = (
+                    ordered[count // 2 - 1] +
+                    ordered[count // 2]
+                ) * 0.5
+
+            spread = ordered[-1] - ordered[0]
+
+            gcmd.respond_info(
+                "Wipe-point X%.1f Y%.1f median=%.5f spread=%.5f "
+                "from %d contacts"
+                % (
+                    x, y,
+                    median_z,
+                    spread,
+                    count))
+
+            return median_z
+
+        start_contact = probe_contact_median(start_x, start_y)
+        end_contact = probe_contact_median(start_x, end_y)
 
         # Heat to Creality's nozzle rubbing temperature.
         self.gcode.run_script_from_command("M109 S200")
@@ -812,6 +1410,30 @@ class StrainGaugeZCal:
             2.0)
         toolhead.wait_moves()
 
+        # Creality factory order: retract filament immediately before
+        # rubbing the hot nozzle across the measured cleaning surface.
+        pumpback_mm = gcmd.get_float(
+            "PUMPBACK", 10.0, minval=0.0, maxval=20.0)
+
+        if pumpback_mm > 0.0:
+            gcmd.respond_info(
+                "Filament pumpback: retracting %.1fmm before wipe..."
+                % pumpback_mm)
+
+            gcode_move = self.printer.lookup_object('gcode_move')
+            was_absolute_extrude = gcode_move.get_status(
+                reactor.monotonic()
+            ).get('absolute_extrude', True)
+
+            self.gcode.run_script_from_command("M83")
+            self.gcode.run_script_from_command(
+                "G1 E-%.3f F300" % pumpback_mm)
+
+            if was_absolute_extrude:
+                self.gcode.run_script_from_command("M82")
+            else:
+                self.gcode.run_script_from_command("M83")
+
         for i in range(passes):
             if i % 2 == 0:
                 toolhead.manual_move(
@@ -826,36 +1448,22 @@ class StrainGaugeZCal:
         toolhead.manual_move([None, None, 10.0], 5.0)
         toolhead.wait_moves()
 
-        # Creality-style filament pumpback.
-        # Retract while still at 200C so freshly cleaned nozzle does not
-        # immediately grow another ooze/nub before Z calibration.
-        pumpback_mm = gcmd.get_float(
-            "PUMPBACK", 10.0, minval=0.0, maxval=20.0)
-
-        if pumpback_mm > 0.0:
-            gcmd.respond_info(
-                "Filament pumpback: retracting %.1fmm before cooldown..."
-                % pumpback_mm)
-
-            gcode_move = self.printer.lookup_object('gcode_move')
-            was_absolute_extrude = gcode_move.get_status(
-                self.printer.get_reactor().monotonic()
-            ).get('absolute_extrude', True)
-
-            self.gcode.run_script_from_command("M83")
-            self.gcode.run_script_from_command(
-                "G1 E-%.3f F300" % pumpback_mm)
-
-            if was_absolute_extrude:
-                self.gcode.run_script_from_command("M82")
-            else:
-                self.gcode.run_script_from_command("M83")
-
         # Cool to Creality's calibration temperature.
         self.gcode.run_script_from_command("M104 S140")
         self.gcode.run_script_from_command("M106 S255")
         self.gcode.run_script_from_command("M109 S140")
         self.gcode.run_script_from_command("M106 S0")
+
+        if mesh_was_active and active_profile:
+            gcmd.respond_info(
+                "Restoring bed mesh profile '%s'..."
+                % active_profile)
+            self.gcode.run_script_from_command(
+                'BED_MESH_PROFILE LOAD="%s"' % active_profile)
+
+        gcmd.respond_info(
+            "Nozzle prep complete. Re-homing Z at 140C / 60C...")
+        self.gcode.run_script_from_command("G28 Z")
 
         gcmd.respond_info(
             "=== NOZZLE PREP COMPLETE ===\n"
