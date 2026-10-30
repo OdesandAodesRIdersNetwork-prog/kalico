@@ -882,13 +882,21 @@ class MCU:
             self._shutdown_clock = self.clock32_to_clock64(clock)
         self._shutdown_msg = msg = params["static_string_id"]
         if get_danger_options().log_shutdown_info:
+            try:
+                clocksync_debug = self._clocksync.dump_debug()
+            except Exception as e:
+                clocksync_debug = "clocksync debug unavailable: %r" % (e,)
+            try:
+                serial_debug = self._serial.dump_debug()
+            except Exception as e:
+                serial_debug = "serial debug unavailable: %r" % (e,)
             logging.info(
                 "MCU '%s' %s: %s\n%s\n%s",
                 self._name,
                 params["#name"],
                 self._shutdown_msg,
-                self._clocksync.dump_debug(),
-                self._serial.dump_debug(),
+                clocksync_debug,
+                serial_debug,
             )
         prefix = "MCU '%s' shutdown: " % (self._name,)
         if params["#name"] == "is_shutdown":

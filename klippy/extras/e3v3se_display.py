@@ -3444,6 +3444,11 @@ class E3v3seDisplay:
         # Copy into filebuf string before entry
         name = self.pd.file_name
         if name:
+            # Keep the V3 SE LCD text frame bounded. Long slicer-generated
+            # filenames can overload the printer/display serial path.
+            name = name.encode("ascii", "replace").decode("ascii")
+            if len(name) > 30:
+                name = name[:27] + "..."
             npos = (
                 _MAX(0, self.lcd.screen_width - len(name) * self.MENU_CHR_W) / 2
             )
