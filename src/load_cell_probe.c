@@ -37,6 +37,15 @@ typedef int64_t fixedQ48_t;
 #define ERROR_OVERFLOW 1
 #define ERROR_WATCHDOG 2
 
+// Creality PRTouch-compatible waveform trigger.
+// V3 SE HX711 runs at approximately 80Hz (12.5ms/sample).
+#define PRTOUCH_BUF_LEN 32
+#define PRTOUCH_Q16_ONE 65536LL
+#define PRTOUCH_HP_COEFF_Q16 56639LL
+#define PRTOUCH_LP_K1_Q16 45875LL
+#define TRIGGER_SOURCE_PRTOUCH 1
+#define TRIGGER_SOURCE_FORCE 2
+
 // Flags
 enum {FLAG_IS_HOMING = 1 << 0
     , FLAG_IS_HOMING_TRIGGER = 1 << 1
@@ -55,6 +64,15 @@ struct load_cell_probe {
     fixedQ16_t trigger_grams_fixed;
     fixedQ2_t grams_per_count;
     struct sos_filter *sf;
+
+    // Optional Creality-style waveform trigger.
+    uint8_t prtouch_enabled;
+    uint8_t prtouch_count;
+    uint8_t prtouch_index;
+    uint8_t trigger_source;
+    uint32_t prtouch_min_hold;
+    uint32_t prtouch_max_hold;
+    int32_t prtouch_buf[PRTOUCH_BUF_LEN];
 };
 
 static inline uint8_t
@@ -102,12 +120,13 @@ clear_flag(uint8_t mask, struct load_cell_probe *lcp)
 }
 
 void
-try_trigger(struct load_cell_probe *lcp, uint32_t ticks)
+try_trigger(struct load_cell_probe *lcp, uint32_t ticks, uint8_t source)
 {
     uint8_t is_homing_triggered = is_flag_set(FLAG_IS_HOMING_TRIGGER, lcp);
     if (!is_homing_triggered) {
         // the first triggering sample when homing sets the trigger time
         lcp->trigger_ticks = ticks;
+        lcp->trigger_source = source;
         // this flag latches until a reset, disabling further triggering
         set_flag(FLAG_IS_HOMING_TRIGGER, lcp);
         trsync_do_trigger(lcp->ts, lcp->trigger_reason);
@@ -118,6 +137,191 @@ void
 trigger_error(struct load_cell_probe *lcp, uint8_t error_code)
 {
     trsync_do_trigger(lcp->ts, lcp->error_reason + error_code);
+}
+
+// Return absolute magnitude without overflowing INT32_MIN.
+static inline int64_t
+prtouch_abs32(int32_t value)
+{
+    return value < 0 ? -(int64_t)value : (int64_t)value;
+}
+
+static void
+prtouch_reset(struct load_cell_probe *lcp)
+{
+    lcp->prtouch_count = 0;
+    lcp->prtouch_index = 0;
+    for (uint8_t i = 0; i < PRTOUCH_BUF_LEN; i++)
+        lcp->prtouch_buf[i] = 0;
+}
+
+static void
+prtouch_add_sample(struct load_cell_probe *lcp, int32_t value)
+{
+    lcp->prtouch_buf[lcp->prtouch_index] = value;
+    lcp->prtouch_index =
+        (lcp->prtouch_index + 1) % PRTOUCH_BUF_LEN;
+
+    if (lcp->prtouch_count < PRTOUCH_BUF_LEN)
+        lcp->prtouch_count++;
+}
+
+// Creality non-ADC PRTouch trigger semantics.
+//
+// Signal path:
+// raw HX711 -> tare subtraction -> 32 sample FIFO
+// -> polarity normalization -> 3-point min-absolute filter
+// -> high-pass -> recursive low-pass
+// -> max-hold OR rising/dominance/min-hold trigger.
+//
+// Filters are implemented in Q16 fixed point to avoid floating-point
+// work inside the MCU sampling path.
+static uint8_t
+prtouch_check_trigger(struct load_cell_probe *lcp)
+{
+    if (lcp->prtouch_count < PRTOUCH_BUF_LEN)
+        return 0;
+
+    // prtouch_index points to the oldest sample once the ring is full.
+    uint8_t base = lcp->prtouch_index;
+
+    // Creality polarity normalization is based on the original
+    // first and last samples before filtering.
+    int32_t first = lcp->prtouch_buf[base];
+    uint8_t last_idx =
+        (base + PRTOUCH_BUF_LEN - 1) % PRTOUCH_BUF_LEN;
+    int32_t last = lcp->prtouch_buf[last_idx];
+    uint8_t invert = last < first;
+
+    // Keep a three-sample sliding window instead of copying the
+    // entire 32-sample FIFO onto the MCU stack.
+    int32_t s0 = first;
+    int32_t s1 =
+        lcp->prtouch_buf[(base + 1) % PRTOUCH_BUF_LEN];
+    int32_t s2 =
+        lcp->prtouch_buf[(base + 2) % PRTOUCH_BUF_LEN];
+
+    if (invert) {
+        s0 = -s0;
+        s1 = -s1;
+        s2 = -s2;
+    }
+
+    // Stream the Creality high-pass and recursive low-pass filters.
+    //
+    // hp_prev is the previous HIGH-PASS output.
+    // lp_prev is the previous LOW-PASS output.
+    //
+    // This is mathematically equivalent to the former two-array
+    // implementation, but does not retain all 32 filtered values.
+    int32_t prev_data = 0;
+    int64_t hp_prev = 0;
+    int64_t lp_prev = 0;
+
+    // filtered[0] in the original implementation was zero, so include
+    // zero in the maximum of samples 0..28.
+    int64_t earlier_max = 0;
+
+    int64_t p29 = 0;
+    int64_t p30 = 0;
+    int64_t p31 = 0;
+
+    for (uint8_t i = 0; i < PRTOUCH_BUF_LEN; i++) {
+        int32_t data_i;
+
+        // Creality non-ADC T filter. The final two samples remain
+        // unfiltered, matching the original in-place implementation.
+        if (i < PRTOUCH_BUF_LEN - 2) {
+            int32_t chosen =
+                prtouch_abs32(s0) < prtouch_abs32(s1)
+                ? s0 : s1;
+
+            if (prtouch_abs32(s2) < prtouch_abs32(chosen))
+                chosen = s2;
+
+            data_i = chosen;
+        } else {
+            data_i = s0;
+        }
+
+        // filtered[0] is zero in the original implementation.
+        if (i != 0) {
+            int64_t input =
+                ((int64_t)data_i - (int64_t)prev_data)
+                * PRTOUCH_Q16_ONE;
+            input += hp_prev;
+
+            int64_t hp =
+                (input * PRTOUCH_HP_COEFF_Q16) >> 16;
+
+            int64_t lp =
+                (
+                    hp * PRTOUCH_LP_K1_Q16
+                    + lp_prev
+                      * (PRTOUCH_Q16_ONE - PRTOUCH_LP_K1_Q16)
+                ) >> 16;
+
+            hp_prev = hp;
+            lp_prev = lp;
+
+            if (i <= PRTOUCH_BUF_LEN - 4) {
+                if (lp > earlier_max)
+                    earlier_max = lp;
+            } else if (i == PRTOUCH_BUF_LEN - 3) {
+                p29 = lp;
+            } else if (i == PRTOUCH_BUF_LEN - 2) {
+                p30 = lp;
+            } else {
+                p31 = lp;
+            }
+        }
+
+        prev_data = data_i;
+
+        // Advance the three-sample raw window.
+        if (i < PRTOUCH_BUF_LEN - 1) {
+            s0 = s1;
+            s1 = s2;
+
+            uint8_t next_pos = i + 3;
+            if (next_pos < PRTOUCH_BUF_LEN) {
+                uint8_t idx =
+                    (base + next_pos) % PRTOUCH_BUF_LEN;
+                s2 = lcp->prtouch_buf[idx];
+
+                if (invert)
+                    s2 = -s2;
+            }
+        }
+    }
+
+    int64_t min_hold =
+        (int64_t)lcp->prtouch_min_hold * PRTOUCH_Q16_ONE;
+    int64_t max_hold =
+        (int64_t)lcp->prtouch_max_hold * PRTOUCH_Q16_ONE;
+
+    // Factory path 1: max-hold fast trigger.
+    if (p31 > max_hold
+        && p30 > max_hold / 2
+        && p29 > max_hold / 3)
+        return 1;
+
+    // Factory path 2: final three samples must be rising.
+    if (!(p31 > p30 && p30 > p29))
+        return 0;
+
+    // Factory dominance rule: all final three samples must exceed
+    // every filtered sample from indices 0 through 28.
+    if (!(p31 > earlier_max
+          && p30 > earlier_max
+          && p29 > earlier_max))
+        return 0;
+
+    // Factory minimum hold.
+    if (p31 < min_hold)
+        return 0;
+
+    return 1;
 }
 
 // Used by Sensors to report new raw ADC sample
@@ -152,6 +356,20 @@ load_cell_probe_report_sample(struct load_cell_probe *lcp
         return;
     }
 
+    // Feed the raw, tare-referenced HX711 value into the optional
+    // Creality waveform trigger before Kalico's grams/SOS path.
+    if (lcp->prtouch_enabled) {
+        int32_t prtouch_value = sample - lcp->tare_counts;
+        prtouch_add_sample(lcp, prtouch_value);
+
+        if (prtouch_check_trigger(lcp)) {
+            try_trigger(
+                lcp, lcp->last_sample_ticks,
+                TRIGGER_SOURCE_PRTOUCH);
+            return;
+        }
+    }
+
     // convert sample to grams
     const fixedQ48_t raw_grams = counts_to_grams(lcp, sample);
     if (overflows_int32(raw_grams)) {
@@ -164,7 +382,11 @@ load_cell_probe_report_sample(struct load_cell_probe *lcp
 
     // update trigger state
     if (abs(filtered_grams) >= lcp->trigger_grams_fixed) {
-        try_trigger(lcp, lcp->last_sample_ticks);
+        // Keep the existing Kalico force trigger as a safe fallback
+        // while the Creality waveform path is being validated live.
+        try_trigger(
+            lcp, lcp->last_sample_ticks,
+            TRIGGER_SOURCE_FORCE);
     }
 }
 
@@ -226,6 +448,11 @@ command_config_load_cell_probe(uint32_t *args)
     lcp->trigger_ticks = 0;
     lcp->watchdog_max = 0;
     lcp->watchdog_count = 0;
+    lcp->prtouch_enabled = 0;
+    lcp->prtouch_min_hold = 1000;
+    lcp->prtouch_max_hold = 1500;
+    lcp->trigger_source = 0;
+    prtouch_reset(lcp);
     lcp->sf = sos_filter_oid_lookup(args[1]);
     set_endstop_range(lcp, 0, 0, 0, 0, 0);
 }
@@ -251,6 +478,24 @@ DECL_COMMAND(command_load_cell_probe_set_range, "load_cell_probe_set_range"
     " oid=%c safety_counts_min=%i safety_counts_max=%i tare_counts=%i"
     " trigger_grams=%u grams_per_count=%i");
 
+// Enable or disable Creality-compatible waveform triggering.
+// min_hold/max_hold remain in Creality filtered sensor units.
+void
+command_load_cell_probe_set_prtouch(uint32_t *args)
+{
+    struct load_cell_probe *lcp =
+        load_cell_probe_oid_lookup(args[0]);
+
+    lcp->prtouch_enabled = args[1];
+    lcp->prtouch_min_hold = args[2];
+    lcp->prtouch_max_hold = args[3];
+    prtouch_reset(lcp);
+}
+DECL_COMMAND(
+    command_load_cell_probe_set_prtouch,
+    "load_cell_probe_set_prtouch"
+    " oid=%c enabled=%c min_hold=%u max_hold=%u");
+
 // Home an axis
 void
 command_load_cell_probe_home(uint32_t *args)
@@ -261,6 +506,8 @@ command_load_cell_probe_home(uint32_t *args)
     clear_flag(FLAG_IS_HOMING_TRIGGER, lcp);
     clear_flag(FLAG_IS_HOMING, lcp);
     lcp->trigger_ticks = 0;
+    lcp->trigger_source = 0;
+    prtouch_reset(lcp);
     lcp->ts = NULL;
     // 0 samples indicates homing is finished
     if (args[3] == 0) {

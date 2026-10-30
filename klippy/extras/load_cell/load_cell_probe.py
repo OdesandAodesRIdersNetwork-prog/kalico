@@ -431,6 +431,17 @@ class McuLoadCellProbe:
         self._home_cmd = None
         self._query_cmd = None
         self._set_range_cmd = None
+        self._set_prtouch_cmd = None
+
+        # Optional Creality-compatible waveform triggering.
+        # Default remains normal Kalico force triggering.
+        self._prtouch_enabled = config.getboolean(
+            "prtouch_trigger", False)
+        self._prtouch_min_hold = config.getint(
+            "prtouch_min_hold", 1000, minval=1)
+        self._prtouch_max_hold = config.getint(
+            "prtouch_max_hold", 1500, minval=1)
+
         self._mcu.register_config_callback(self._build_config)
         self._printer.register_event_handler("klippy:connect", self._on_connect)
 
@@ -461,9 +472,26 @@ class McuLoadCellProbe:
             cq=self._cmd_queue,
         )
 
+        if self._prtouch_enabled:
+            self._set_prtouch_cmd = self._mcu.lookup_command(
+                "load_cell_probe_set_prtouch"
+                " oid=%c enabled=%c min_hold=%u max_hold=%u",
+                cq=self._cmd_queue,
+            )
+
     # the sensor data stream is connected on the MCU at the ready event
     def _on_connect(self):
         self._sensor.attach_load_cell_probe(self._oid)
+
+        if self._prtouch_enabled:
+            self._set_prtouch_cmd.send(
+                [
+                    self._oid,
+                    1,
+                    self._prtouch_min_hold,
+                    self._prtouch_max_hold,
+                ]
+            )
 
     def get_oid(self):
         return self._oid
