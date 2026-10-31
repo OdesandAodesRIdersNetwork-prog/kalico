@@ -1018,60 +1018,138 @@ class StrainGaugeZCal:
         intervals.sort()
         sample_dt = intervals[len(intervals) // 2]
 
-        cal_hftr_cut = 10.0
-        rc = 1.0 / (2.0 * math.pi * cal_hftr_cut)
-        coff = rc / (rc + sample_dt)
+        def calc_event_index(filter_dt):
+            cal_hftr_cut = 10.0
+            rc = 1.0 / (2.0 * math.pi * cal_hftr_cut)
+            coff = rc / (rc + filter_dt)
 
-        source = list(data)
-        filtered = [0.0]
+            source = list(data)
+            filtered = [0.0]
 
-        for i in range(1, len(source)):
-            filtered.append(
-                (source[i] - source[i - 1] + filtered[-1]) * coff)
+            for i in range(1, len(source)):
+                filtered.append(
+                    (source[i] - source[i - 1] + filtered[-1]) * coff)
 
-        # Creality non-ADC default cal_lftr_k1 = 0.85.
-        cal_lftr_k1 = 0.85
+            # Creality non-ADC default cal_lftr_k1 = 0.85.
+            cal_lftr_k1 = 0.85
 
-        for i in range(1, len(filtered)):
-            filtered[i] = (
-                filtered[i - 1] * (1.0 - cal_lftr_k1)
-                + filtered[i] * cal_lftr_k1)
+            for i in range(1, len(filtered)):
+                filtered[i] = (
+                    filtered[i - 1] * (1.0 - cal_lftr_k1)
+                    + filtered[i] * cal_lftr_k1)
 
-        min_val = min(filtered)
-        max_val = max(filtered)
-        value_range = max_val - min_val
+            min_val = min(filtered)
+            max_val = max(filtered)
+            value_range = max_val - min_val
 
-        if abs(value_range) < 1.0e-12:
+            if abs(value_range) < 1.0e-12:
+                return None
+
+            vals = [
+                (value - min_val) / value_range
+                for value in filtered
+            ]
+
+            # Match Creality cal_tri_data() de-trend / rotation.
+            angle = math.atan(
+                (vals[-1] - vals[0]) / float(len(vals)))
+
+            sin_angle = math.sin(-angle)
+            cos_angle = math.cos(-angle)
+
+            detrended = []
+
+            for i, value in enumerate(vals):
+                detrended.append(
+                    float(i) * sin_angle
+                    + value * cos_angle)
+
+            return detrended.index(min(detrended))
+
+        # Preserve current measured-interval behavior.
+        event_index = calc_event_index(sample_dt)
+
+        if event_index is None:
             return None, len(window), None, None
 
-        vals = [
-            (value - min_val) / value_range
-            for value in filtered
-        ]
-
-        # Match Creality cal_tri_data() de-trend / rotation.
-        angle = math.atan(
-            (vals[-1] - vals[0]) / float(len(vals)))
-
-        sin_angle = math.sin(-angle)
-        cos_angle = math.cos(-angle)
-
-        detrended = []
-
-        for i, value in enumerate(vals):
-            detrended.append(
-                float(i) * sin_angle
-                + value * cos_angle)
-
-        event_index = detrended.index(min(detrended))
         event_time = times[event_index]
 
-        # Same synchronized constant-speed mapping already proven in the
-        # native Kalico path.
-        event_z = (
+        # Diagnostic A/B against Creality factory tri_acq_ms=12.
+        factory_event_index = calc_event_index(0.012)
+
+        if factory_event_index is not None:
+            factory_event_time = times[factory_event_index]
+
+            logging.info(
+                "strain_gauge_z_cal: filter dt A/B "
+                "measured_dt=%.3fms measured_index=%d "
+                "factory12_index=%d index_delta=%+d "
+                "measured_before=%.3fms factory_before=%.3fms "
+                "z_delta=%+.6f",
+                sample_dt * 1000.0,
+                event_index,
+                factory_event_index,
+                factory_event_index - event_index,
+                (trigger_time - event_time) * 1000.0,
+                (trigger_time - factory_event_time) * 1000.0,
+                speed * (event_time - factory_event_time),
+            )
+
+        # Keep the previous constant-speed mapping for comparison.
+        constant_speed_z = (
             trigger_z
             + speed * (trigger_time - event_time)
         )
+        event_z = constant_speed_z
+
+        # Kalico already retains historical MCU step positions.  Rebuild
+        # Cartesian Z at the pressure event and trigger timestamps using
+        # the same printer kinematics used by HomingMove.
+        try:
+            toolhead = self._get_toolhead()
+            kin = toolhead.get_kinematics()
+
+            event_spos = {}
+            trigger_spos = {}
+
+            for stepper in kin.get_steppers():
+                name = stepper.get_name()
+
+                event_mcu = stepper.get_past_mcu_position(event_time)
+                trigger_mcu = stepper.get_past_mcu_position(trigger_time)
+
+                event_spos[name] = stepper.mcu_to_commanded_position(
+                    event_mcu)
+                trigger_spos[name] = stepper.mcu_to_commanded_position(
+                    trigger_mcu)
+
+            event_cart = kin.calc_position(event_spos)
+            trigger_cart = kin.calc_position(trigger_spos)
+
+            historical_z = (
+                trigger_z
+                + event_cart[2]
+                - trigger_cart[2]
+            )
+
+            logging.info(
+                "strain_gauge_z_cal: event Z mapping "
+                "constant=%.6f historical=%.6f delta=%.6f "
+                "event_calc_z=%.6f trigger_calc_z=%.6f",
+                constant_speed_z,
+                historical_z,
+                historical_z - constant_speed_z,
+                event_cart[2],
+                trigger_cart[2],
+            )
+
+            event_z = historical_z
+
+        except Exception:
+            logging.exception(
+                "strain_gauge_z_cal: historical event Z lookup failed; "
+                "using constant-speed mapping"
+            )
 
         before_trigger_ms = (
             (trigger_time - event_time) * 1000.0)
@@ -2290,6 +2368,43 @@ class StrainGaugeZCal:
         eventtime = self.printer.get_reactor().monotonic()
         trigger_time = self._native_primitives.get_status(
             eventtime)["last_trigger_time"]
+
+        creality_samples = (
+            self._native_mcu_probe.get_last_prtouch_snapshot()
+        )
+
+        if len(creality_samples) == 32:
+            (
+                creality_event_z,
+                creality_event_count,
+                creality_event_index,
+                creality_before_ms,
+            ) = self._analyze_creality_contact_event(
+                creality_samples,
+                trigger_time,
+                trigger_z,
+                speed)
+
+            if creality_event_z is not None:
+                gcmd.respond_info(
+                    "Frozen MCU event diagnostic: Z=%.5f "
+                    "index=%d before_trigger=%.1fms samples=%d"
+                    % (
+                        creality_event_z,
+                        creality_event_index,
+                        creality_before_ms,
+                        creality_event_count,
+                    ))
+            else:
+                gcmd.respond_info(
+                    "Frozen MCU event diagnostic unavailable "
+                    "(samples=%d)"
+                    % creality_event_count)
+        else:
+            gcmd.respond_info(
+                "Frozen MCU PRTouch FIFO unavailable/incomplete "
+                "(samples=%d expected=32)"
+                % len(creality_samples))
 
         # Map timestamped HX711 samples back onto the constant-speed
         # Z trajectory around the MCU trigger.

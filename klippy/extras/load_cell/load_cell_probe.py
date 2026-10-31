@@ -751,9 +751,35 @@ class LoadCellPrimitives:
         # use collect_min collected samples are not wasted
         results = collector.collect_min(num_samples)
         tare_samples = check_sensor_errors(results, self._printer)
-        tare_counts = int(
-            np.average(np.array(tare_samples)[:, 2].astype(float))
+
+        tare_values = np.array(tare_samples)[:, 2].astype(float)
+        tare_average = float(np.average(tare_values))
+
+        logging.info(
+            "load_cell_probe: tare sample_count=%d values=%s average=%.2f",
+            len(tare_values),
+            [int(v) for v in tare_values],
+            tare_average,
         )
+
+        if len(tare_values) >= 8:
+            creality_values = list(tare_values[:8])
+            sorted_tare = sorted(creality_values)
+            creality_trimmed = float(
+                np.average(sorted_tare[2:-2])
+            )
+            logging.info(
+                "load_cell_probe: tare_compare count=%d "
+                "kalico_average=%.2f creality_first8_trimmed=%.2f "
+                "delta=%.2f first8=%s",
+                len(tare_values),
+                tare_average,
+                creality_trimmed,
+                creality_trimmed - tare_average,
+                [int(v) for v in creality_values],
+            )
+
+        tare_counts = int(tare_average)
         # update sos_filter with any gcode parameter changes
         self._continuous_tare_filter_helper.update_from_command(gcmd)
         self._mcu_load_cell_probe.set_endstop_range(tare_counts, gcmd)
