@@ -386,6 +386,15 @@ class StrainGaugeZCal:
         gcode = self.printer.lookup_object('gcode')
         reactor = self.printer.get_reactor()
 
+        # Preserve any existing live G-code Z offset.  Creality performs
+        # Z compensation from a zero temporary offset, so calibration must
+        # not inherit a previous SET_GCODE_OFFSET adjustment.
+        gcode_move = self.printer.lookup_object('gcode_move')
+        gcode_move_status = gcode_move.get_status(reactor.monotonic())
+        original_live_z_offset = gcode_move_status['homing_origin'].z
+        live_offset_reset = False
+        keep_calibrated_live_offset = False
+
         probe = self.printer.lookup_object('probe')
         current_offsets = probe.get_offsets()
         x_offset = current_offsets[0]
@@ -444,6 +453,15 @@ class StrainGaugeZCal:
             ))
 
         try:
+            # Match Creality Z-compensation semantics: perform the
+            # measurement with no temporary G-code Z transform active.
+            gcode.run_script_from_command(
+                'SET_GCODE_OFFSET Z=0 MOVE=0')
+            live_offset_reset = True
+            gcmd.respond_info(
+                "Temporarily reset live Z offset: %.5f -> 0.00000"
+                % original_live_z_offset)
+
             if not self._native_mcu_probe.set_prtouch_thresholds(
                     cal_prtouch_min_hold,
                     cal_prtouch_max_hold):
@@ -849,18 +867,55 @@ class StrainGaugeZCal:
                     "ANALYZE_ONLY=1: Z offset was NOT staged or changed.\n"
                     "=== CALIBRATION ANALYSIS COMPLETE ===")
             else:
+                # Creality factory behavior:
+                #   live adjustment = old configured probe offset
+                #                     - newly calculated probe offset
+                #
+                # The live G-code offset was reset to zero above, so this
+                # applies the calculated correction exactly once.
+                live_z_adjust = current_z_offset - new_z_offset
+                gcode.run_script_from_command(
+                    'SET_GCODE_OFFSET Z_ADJUST=%.6f MOVE=1'
+                    % live_z_adjust)
+
                 configfile = self.printer.lookup_object('configfile')
                 configfile.set(
                     self.target_probe_section,
                     'z_offset',
                     "%.3f" % new_z_offset)
 
+                # Calibration succeeded and the new live adjustment is now
+                # intentional.  Do not restore the pre-calibration offset.
+                keep_calibrated_live_offset = True
+
                 gcmd.respond_info(
+                    "Applied live Z compensation: %.5f "
+                    "(%.5f - %.5f)\n"
                     "Z offset staged in config. "
                     "DO NOT run SAVE_CONFIG until the result is verified.\n"
-                    "=== CALIBRATION COMPLETE ===")
+                    "=== CALIBRATION COMPLETE ==="
+                    % (
+                        live_z_adjust,
+                        current_z_offset,
+                        new_z_offset,
+                    ))
 
         finally:
+            # ANALYZE_ONLY and failed calibrations must leave the printer's
+            # previous live Z state exactly as it was before calibration.
+            if live_offset_reset and not keep_calibrated_live_offset:
+                try:
+                    gcode.run_script_from_command(
+                        'SET_GCODE_OFFSET Z=%.6f MOVE=0'
+                        % original_live_z_offset)
+                    gcmd.respond_info(
+                        "Restored previous live Z offset: %.5f"
+                        % original_live_z_offset)
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: Could not restore previous live Z "
+                        "offset: %s" % str(e))
+
             if prtouch_thresholds_switched:
                 try:
                     self._native_mcu_probe.set_prtouch_thresholds(
