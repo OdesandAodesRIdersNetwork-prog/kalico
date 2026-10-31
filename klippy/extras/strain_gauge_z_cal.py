@@ -1481,7 +1481,8 @@ class StrainGaugeZCal:
             self._native_config_helper.get_trigger_force_grams(gcmd))
 
         start_z = 3.0
-        end_z = 0.5
+        end_z = gcmd.get_float(
+            "END_Z", 0.5, minval=-0.5, maxval=0.5)
         retract_z = 5.0
 
         speed_cycles = [
@@ -1616,7 +1617,7 @@ class StrainGaugeZCal:
                         "run": run_number,
                         "cycle": cycle_index + 1,
                         "speed": speed,
-                        "halt": trigger_z,
+                        "trigger": trigger_z,
                         "threshold": threshold_z,
                         "onset": onset_z,
                         "fit_count": fit_count,
@@ -1628,7 +1629,7 @@ class StrainGaugeZCal:
 
                     gcmd.respond_info(
                         "Run %d/9 C%d %.2fmm/s: "
-                        "halt=%.5f threshold=%s onset=%s fit=%d "
+                        "trigger=%.5f threshold=%s onset=%s fit=%d "
                         "Tn=%.1f/%.1fC Tb=%.1f/%.1fC"
                         % (
                             run_number,
@@ -1675,7 +1676,7 @@ class StrainGaugeZCal:
             lines.append("%.2f mm/s:" % speed)
 
             for field, label in [
-                    ("halt", "MCU halt"),
+                    ("trigger", "MCU trigger"),
                     ("threshold", "20g cross"),
                     ("onset", "Contact onset")]:
 
