@@ -37,6 +37,9 @@ class StrainGaugeZCal:
         self.retract_dist = config.getfloat('retract_dist', RETRACT_DIST)
         self.clearance_z = config.getfloat('clearance_z', CLEARANCE_Z)
         self.travel_speed = config.getfloat('travel_speed', 80.)
+        # Creality V3 SE [z_compensate] final nozzle-contact correction.
+        self.tri_expand_mm = config.getfloat(
+            'tri_expand_mm', 0.07, minval=0.0)
         # Target probe section to save z_offset to (usually bltouch)
         self.target_probe_section = config.get('target_probe_section',
                                                'bltouch')
@@ -789,42 +792,30 @@ class StrainGaugeZCal:
                 raise gcmd.error(
                     "Two-point Z compensation did not complete")
 
-            offset_1 = point_results[0]["offset"]
-            offset_2 = point_results[1]["offset"]
+            # Keep the MCU trigger result as a diagnostic only.
+            trigger_offset_1 = point_results[0]["offset"]
+            trigger_offset_2 = point_results[1]["offset"]
+            trigger_combined = (
+                trigger_offset_1 + trigger_offset_2
+            ) / 2.0
 
-            # Creality combines the two physical point measurements.
-            # tri_expand_mm is intentionally NOT applied yet.  First validate
-            # the two-point measurement and contact definition independently.
-            new_z_offset = (offset_1 + offset_2) / 2.0
-
+            # Production Z compensation uses the reconstructed Creality
+            # waveform-event coordinate, matching cal_tri_data semantics.
             event_offset_1 = point_results[0]["event_offset"]
             event_offset_2 = point_results[1]["event_offset"]
 
-            if event_offset_1 is not None and event_offset_2 is not None:
-                event_combined = (
-                    event_offset_1 + event_offset_2
-                ) / 2.0
+            if event_offset_1 is None or event_offset_2 is None:
+                raise gcmd.error(
+                    "Creality waveform event unavailable. "
+                    "Calibration rejected; MCU trigger fallback is disabled.")
 
-                # Diagnostic only.  This shows what the recovered factory
-                # final math would produce if this reconstructed event
-                # coordinate proves equivalent to Creality cal_tri_data().
-                event_with_tri_expand = event_combined - 0.070
+            event_combined = (
+                event_offset_1 + event_offset_2
+            ) / 2.0
 
-                gcmd.respond_info(
-                    "=== CREALITY-EVENT TWO-POINT DIAGNOSTIC ===\n"
-                    "POINT1 event offset: %.5f\n"
-                    "POINT2 event offset: %.5f\n"
-                    "Event point difference: %.5f\n"
-                    "Event combined average: %.5f\n"
-                    "Event average - 0.070: %.5f\n"
-                    "DIAGNOSTIC ONLY - NOT USED OR STAGED"
-                    % (
-                        event_offset_1,
-                        event_offset_2,
-                        abs(event_offset_1 - event_offset_2),
-                        event_combined,
-                        event_with_tri_expand,
-                    ))
+            # Creality factory final math:
+            # average(two physical point offsets) - tri_expand_mm.
+            new_z_offset = event_combined - self.tri_expand_mm
 
             if new_z_offset < 0.:
                 raise gcmd.error(
@@ -834,20 +825,23 @@ class StrainGaugeZCal:
 
             gcmd.respond_info(
                 "=== TWO-POINT Z-COMP CALIBRATION RESULT ===\n"
-                "POINT1 offset: %.5f\n"
-                "POINT2 offset: %.5f\n"
-                "Point difference: %.5f\n"
-                "Combined average: %.5f\n"
+                "POINT1 event offset: %.5f\n"
+                "POINT2 event offset: %.5f\n"
+                "Event point difference: %.5f\n"
+                "Event combined average: %.5f\n"
+                "tri_expand_mm: %.5f\n"
                 "Previous Z offset: %.5f\n"
                 "Proposed Z offset: %.5f\n"
-                "tri_expand_mm: NOT APPLIED"
+                "MCU trigger diagnostic average: %.5f"
                 % (
-                    offset_1,
-                    offset_2,
-                    abs(offset_1 - offset_2),
-                    new_z_offset,
+                    event_offset_1,
+                    event_offset_2,
+                    abs(event_offset_1 - event_offset_2),
+                    event_combined,
+                    self.tri_expand_mm,
                     current_z_offset,
                     new_z_offset,
+                    trigger_combined,
                 ))
 
             if analyze_only:
@@ -984,6 +978,18 @@ class StrainGaugeZCal:
 
         times = [item[0] for item in window]
         data = [float(item[1]) for item in window]
+
+        # Diagnostic only: preserve the exact raw frozen FIFO so unstable
+        # Creality event selections can be reconstructed offline.
+        raw_data = list(data)
+        logging.info(
+            "strain_gauge_z_cal: event raw32 "
+            "invert=%s first=%.1f last=%.1f values=%s",
+            raw_data[-1] < raw_data[0],
+            raw_data[0],
+            raw_data[-1],
+            ",".join("%.1f" % value for value in raw_data),
+        )
 
         # Creality normalizes non-ADC pressure polarity before
         # cal_tri_data() filtering so the contact ramp always points
@@ -1455,10 +1461,9 @@ class StrainGaugeZCal:
         probe_speed = gcmd.get_float("SPEED", 0.50, above=0.0)
         search_end_z = gcmd.get_float(
             "SEARCH_END_Z", 0.0, minval=-0.5, maxval=0.3)
-        wipe_speed = gcmd.get_float("WIPE_SPEED", 5.0, above=0.0)
-        wipe_relief = gcmd.get_float(
-            "WIPE_RELIEF", 0.015, minval=0.0, maxval=0.10)
-        passes = gcmd.get_int("PASSES", 6, minval=1, maxval=20)
+        wipe_speed = gcmd.get_float("WIPE_SPEED", 2.0, above=0.0)
+        wipe_depth = gcmd.get_float(
+            "WIPE_DEPTH", 0.15, minval=0.0, maxval=0.30)
         clear_probe_count = gcmd.get_int(
             "CLEAR_PROBE_COUNT", 3, minval=1, maxval=9)
 
@@ -1552,8 +1557,9 @@ class StrainGaugeZCal:
             toolhead.wait_moves()
 
             if threshold_z is None:
-                raise gcmd.error(
-                    "Could not determine raw force threshold at wipe point")
+                threshold_text = "unavailable"
+            else:
+                threshold_text = "%.5f" % threshold_z
 
             if onset_z is None:
                 onset_text = "unavailable"
@@ -1562,21 +1568,19 @@ class StrainGaugeZCal:
 
             gcmd.respond_info(
                 "Wipe-point contact X%.1f Y%.1f: "
-                "halt=%.5f raw %.1fg=%.5f onset=%s fit=%d"
+                "MCU trigger=%.5f raw %.1fg=%s onset=%s fit=%d"
                 % (
                     x, y,
                     trigger_z,
                     trigger_force,
-                    threshold_z,
+                    threshold_text,
                     onset_text,
                     fit_count))
 
             if creality_z is None:
-                gcmd.respond_info(
-                    "Creality-event X%.1f Y%.1f: unavailable n=%d"
-                    % (
-                        x, y,
-                        creality_count))
+                raise gcmd.error(
+                    "Could not determine Creality waveform event "
+                    "at wipe point X%.1f Y%.1f" % (x, y))
             else:
                 gcmd.respond_info(
                     "Creality-event X%.1f Y%.1f: "
@@ -1670,7 +1674,7 @@ class StrainGaugeZCal:
                         rise_samples,
                         rise_text))
 
-            return threshold_z
+            return creality_z
 
         gcmd.respond_info(
             "=== STRAIN GAUGE NOZZLE PREP ===\n"
@@ -1726,25 +1730,75 @@ class StrainGaugeZCal:
 
             return median_z
 
-        start_contact = probe_contact_median(start_x, start_y)
-        end_contact = probe_contact_median(start_x, end_y)
+        # Creality's nozzle-clear endpoint probes are part of the
+        # z_compensate process and use its 1400/2000 PRTouch thresholds.
+        prep_prtouch_min_hold = gcmd.get_int(
+            "PRTOUCH_MIN_HOLD", 1400, minval=1)
+        prep_prtouch_max_hold = gcmd.get_int(
+            "PRTOUCH_MAX_HOLD", 2000, minval=1)
+
+        if prep_prtouch_min_hold >= prep_prtouch_max_hold:
+            raise gcmd.error(
+                "PRTOUCH_MIN_HOLD must be less than PRTouch max hold")
+
+        normal_prtouch_min_hold, normal_prtouch_max_hold = (
+            self._native_mcu_probe.get_prtouch_thresholds()
+        )
+        prtouch_thresholds_switched = False
+
+        try:
+            if not self._native_mcu_probe.set_prtouch_thresholds(
+                    prep_prtouch_min_hold,
+                    prep_prtouch_max_hold):
+                raise gcmd.error(
+                    "PRTouch waveform triggering is not enabled")
+
+            prtouch_thresholds_switched = True
+
+            gcmd.respond_info(
+                "Nozzle-prep PRTouch thresholds: min=%d max=%d"
+                % (
+                    prep_prtouch_min_hold,
+                    prep_prtouch_max_hold,
+                )
+            )
+
+            start_contact = probe_contact_median(start_x, start_y)
+            end_contact = probe_contact_median(start_x, end_y)
+
+        finally:
+            if prtouch_thresholds_switched:
+                try:
+                    self._native_mcu_probe.set_prtouch_thresholds(
+                        normal_prtouch_min_hold,
+                        normal_prtouch_max_hold)
+                    gcmd.respond_info(
+                        "Restored normal PRTouch thresholds: min=%d max=%d"
+                        % (
+                            normal_prtouch_min_hold,
+                            normal_prtouch_max_hold,
+                        )
+                    )
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: Could not restore normal PRTouch "
+                        "thresholds: %s" % str(e))
 
         # Heat to Creality's nozzle rubbing temperature.
         self.gcode.run_script_from_command("M109 S200")
 
-        # Positive relief means we stay ABOVE the measured 20g
-        # crossing.  We deliberately do not copy Creality's
-        # aggressive -0.15mm penetration.
-        start_wipe_z = start_contact + wipe_relief
-        end_wipe_z = end_contact + wipe_relief
+        # Creality factory wipe geometry around the measured
+        # waveform-event surface.
+        start_wipe_z = start_contact + wipe_depth
+        end_wipe_z = end_contact - wipe_depth
 
         gcmd.respond_info(
-            "Wiping at Z %.5f -> %.5f, relief=+%.3fmm, passes=%d"
+            "Factory wipe Z %.5f -> %.5f, depth=%.3fmm, speed=%.2fmm/s"
             % (
                 start_wipe_z,
                 end_wipe_z,
-                wipe_relief,
-                passes))
+                wipe_depth,
+                wipe_speed))
 
         toolhead.manual_move([None, None, 5.0], 5.0)
         toolhead.wait_moves()
@@ -1783,16 +1837,11 @@ class StrainGaugeZCal:
             else:
                 self.gcode.run_script_from_command("M83")
 
-        for i in range(passes):
-            if i % 2 == 0:
-                toolhead.manual_move(
-                    [start_x, end_y, end_wipe_z],
-                    wipe_speed)
-            else:
-                toolhead.manual_move(
-                    [start_x, start_y, start_wipe_z],
-                    wipe_speed)
-            toolhead.wait_moves()
+        # Factory behavior: one controlled sloped traverse.
+        toolhead.manual_move(
+            [start_x, end_y, end_wipe_z],
+            wipe_speed)
+        toolhead.wait_moves()
 
         toolhead.manual_move([None, None, 10.0], 5.0)
         toolhead.wait_moves()
