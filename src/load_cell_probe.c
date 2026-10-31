@@ -73,6 +73,7 @@ struct load_cell_probe {
     uint32_t prtouch_min_hold;
     uint32_t prtouch_max_hold;
     int32_t prtouch_buf[PRTOUCH_BUF_LEN];
+    uint32_t prtouch_ticks[PRTOUCH_BUF_LEN];
 };
 
 static inline uint8_t
@@ -151,14 +152,19 @@ prtouch_reset(struct load_cell_probe *lcp)
 {
     lcp->prtouch_count = 0;
     lcp->prtouch_index = 0;
-    for (uint8_t i = 0; i < PRTOUCH_BUF_LEN; i++)
+    for (uint8_t i = 0; i < PRTOUCH_BUF_LEN; i++) {
         lcp->prtouch_buf[i] = 0;
+        lcp->prtouch_ticks[i] = 0;
+    }
 }
 
 static void
-prtouch_add_sample(struct load_cell_probe *lcp, int32_t value)
+prtouch_add_sample(
+    struct load_cell_probe *lcp, int32_t value, uint32_t ticks)
 {
     lcp->prtouch_buf[lcp->prtouch_index] = value;
+    lcp->prtouch_ticks[lcp->prtouch_index] = ticks;
+
     lcp->prtouch_index =
         (lcp->prtouch_index + 1) % PRTOUCH_BUF_LEN;
 
@@ -358,9 +364,10 @@ load_cell_probe_report_sample(struct load_cell_probe *lcp
 
     // Feed the raw, tare-referenced HX711 value into the optional
     // Creality waveform trigger before Kalico's grams/SOS path.
-    if (lcp->prtouch_enabled) {
+    if (lcp->prtouch_enabled
+            && !is_flag_set(FLAG_IS_HOMING_TRIGGER, lcp)) {
         int32_t prtouch_value = sample - lcp->tare_counts;
-        prtouch_add_sample(lcp, prtouch_value);
+        prtouch_add_sample(lcp, prtouch_value, ticks);
 
         if (prtouch_check_trigger(lcp)) {
             try_trigger(
@@ -380,10 +387,11 @@ load_cell_probe_report_sample(struct load_cell_probe *lcp
     // perform filtering
     const fixedQ16_t filtered_grams = sosfilt(lcp->sf, (fixedQ16_t)raw_grams);
 
-    // update trigger state
-    if (abs(filtered_grams) >= lcp->trigger_grams_fixed) {
-        // Keep the existing Kalico force trigger as a safe fallback
-        // while the Creality waveform path is being validated live.
+    // Use the Kalico force trigger only when Creality-compatible
+    // PRTouch waveform triggering is disabled.  The independent safety
+    // range above remains active in both modes.
+    if (!lcp->prtouch_enabled
+            && abs(filtered_grams) >= lcp->trigger_grams_fixed) {
         try_trigger(
             lcp, lcp->last_sample_ticks,
             TRIGGER_SOURCE_FORCE);
@@ -545,3 +553,54 @@ command_load_cell_probe_query_state(uint32_t *args)
 }
 DECL_COMMAND(command_load_cell_probe_query_state
                 , "load_cell_probe_query_state oid=%c");
+
+// Query one sample from the frozen Creality-compatible PRTouch FIFO.
+//
+// "index" is chronological:
+//   0  = oldest sample in the trigger window
+//   31 = newest sample that caused the PRTouch trigger
+//
+// The ring stops advancing as soon as FLAG_IS_HOMING_TRIGGER is set,
+// so these values and MCU timestamps represent the exact trigger FIFO.
+void
+command_load_cell_probe_query_prtouch_sample(uint32_t *args)
+{
+    uint8_t oid = args[0];
+    uint8_t logical_index = args[1];
+
+    struct load_cell_probe *lcp =
+        load_cell_probe_oid_lookup(oid);
+
+    uint8_t valid =
+        logical_index < lcp->prtouch_count
+        && logical_index < PRTOUCH_BUF_LEN;
+
+    int32_t sample = 0;
+    uint32_t ticks = 0;
+
+    if (valid) {
+        uint8_t base =
+            lcp->prtouch_count < PRTOUCH_BUF_LEN
+            ? 0
+            : lcp->prtouch_index;
+
+        uint8_t physical_index =
+            (base + logical_index) % PRTOUCH_BUF_LEN;
+
+        sample = lcp->prtouch_buf[physical_index];
+        ticks = lcp->prtouch_ticks[physical_index];
+    }
+
+    sendf(
+        "load_cell_probe_prtouch_sample"
+        " oid=%c index=%c valid=%c sample=%i ticks=%u",
+        oid,
+        logical_index,
+        valid,
+        sample,
+        ticks);
+}
+
+DECL_COMMAND(
+    command_load_cell_probe_query_prtouch_sample,
+    "load_cell_probe_query_prtouch_sample oid=%c index=%c");

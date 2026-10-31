@@ -8,6 +8,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import math
+import random
 from klippy import mcu
 from .load_cell import hx71x, ads1220, load_cell, load_cell_probe
 
@@ -109,6 +110,10 @@ class StrainGaugeZCal:
             'STRAIN_GAUGE_NATIVE_BENCHMARK',
             self.cmd_STRAIN_GAUGE_NATIVE_BENCHMARK,
             desc="Benchmark native MCU strain contact across probe speeds")
+        self.gcode.register_command(
+            'STRAIN_GAUGE_PRT_THRESHOLD_BENCHMARK',
+            self.cmd_STRAIN_GAUGE_PRT_THRESHOLD_BENCHMARK,
+            desc="A/B benchmark Creality PRTouch trigger thresholds")
         self.gcode.register_command(
             'STRAIN_GAUGE_NOZZLE_PREP',
             self.cmd_STRAIN_GAUGE_NOZZLE_PREP,
@@ -384,20 +389,34 @@ class StrainGaugeZCal:
         y_offset = current_offsets[1]
         current_z_offset = current_offsets[2]
 
-        # The configured pad_x/pad_y are NOZZLE coordinates for physical
-        # contact with the strain gauge pad.
+        # The configured pad_x/pad_y are the physical center of the
+        # V3 SE Z-compensation strain-gauge area.  Calibration measures
+        # two symmetric physical points around this center.
         #
-        # To put the CR Touch over that SAME physical point:
-        #   probe_position = nozzle_position + probe_offset
-        # therefore:
-        #   nozzle_position = pad_position - probe_offset
-        probe_x = self.pad_x - x_offset
-        probe_y = self.pad_y - y_offset
+        # For any physical nozzle point:
+        #   CR Touch carriage X = physical X - probe X offset
+        #   CR Touch carriage Y = physical Y - probe Y offset
 
         # Remember active mesh so we can restore it after calibration.
         bed_mesh = self.printer.lookup_object('bed_mesh', None)
         mesh_was_active = False
         active_profile = ""
+
+        # Creality V3 SE uses stronger PRTouch waveform thresholds during
+        # Z compensation than during normal PRTouch operation.
+        cal_prtouch_min_hold = gcmd.get_int(
+            "PRTOUCH_MIN_HOLD", 1400, minval=1)
+        cal_prtouch_max_hold = gcmd.get_int(
+            "PRTOUCH_MAX_HOLD", 2000, minval=1)
+
+        if cal_prtouch_min_hold >= cal_prtouch_max_hold:
+            raise gcmd.error(
+                "PRTOUCH_MIN_HOLD must be less than PRTouch max hold")
+
+        normal_prtouch_min_hold, normal_prtouch_max_hold = (
+            self._native_mcu_probe.get_prtouch_thresholds()
+        )
+        prtouch_thresholds_switched = False
 
         if bed_mesh is not None:
             mesh_status = bed_mesh.get_status(reactor.monotonic())
@@ -411,15 +430,33 @@ class StrainGaugeZCal:
                     "Load a saved mesh profile before running calibration.")
 
         gcmd.respond_info(
-            "=== Z OFFSET CALIBRATION (CR Touch + Strain Gauge) ===\n"
-            "Strain pad physical point: X=%.2f Y=%.2f\n"
-            "CR Touch offset: X=%.2f Y=%.2f\n"
-            "CR Touch carriage position: X=%.2f Y=%.2f"
-            % (self.pad_x, self.pad_y,
-               x_offset, y_offset,
-               probe_x, probe_y))
+            "=== Z OFFSET CALIBRATION (CR Touch + PRTouch) ===\n"
+            "Z-compensation center: X=%.2f Y=%.2f\n"
+            "CR Touch offset: X=%.2f Y=%.2f"
+            % (
+                self.pad_x,
+                self.pad_y,
+                x_offset,
+                y_offset,
+            ))
 
         try:
+            if not self._native_mcu_probe.set_prtouch_thresholds(
+                    cal_prtouch_min_hold,
+                    cal_prtouch_max_hold):
+                raise gcmd.error(
+                    "PRTouch waveform triggering is not enabled")
+
+            prtouch_thresholds_switched = True
+
+            gcmd.respond_info(
+                "Calibration PRTouch thresholds: min=%d max=%d"
+                % (
+                    cal_prtouch_min_hold,
+                    cal_prtouch_max_hold,
+                )
+            )
+
             # Remove mesh compensation during ALL calibration measurements.
             if mesh_was_active:
                 gcmd.respond_info(
@@ -428,152 +465,366 @@ class StrainGaugeZCal:
                 gcode.run_script_from_command("BED_MESH_CLEAR")
 
             # ----------------------------------------------------------
-            # STEP 1: CR Touch measurement of the physical strain pad
+            # Creality-style two-point Z compensation.
+            #
+            # Recovered V3 SE configuration uses two symmetric physical
+            # points around the center, with X/Y expansion in the 3..7 mm
+            # range.  Explicit POINT_DX / POINT_DY may be supplied for
+            # repeatable diagnostic testing.
             # ----------------------------------------------------------
-            curpos = toolhead.get_position()
-            safe_z = max(curpos[2], self.clearance_z)
-            toolhead.manual_move([None, None, safe_z], 10.)
-            toolhead.wait_moves()
+            point_dx = gcmd.get_float(
+                "POINT_DX",
+                random.uniform(3.0, 7.0),
+                minval=3.0,
+                maxval=7.0)
+            point_dy = gcmd.get_float(
+                "POINT_DY",
+                random.uniform(3.0, 7.0),
+                minval=3.0,
+                maxval=7.0)
+
+            calibration_points = [
+                (
+                    "POINT1",
+                    self.pad_x + point_dx,
+                    self.pad_y + point_dy,
+                ),
+                (
+                    "POINT2",
+                    self.pad_x - point_dx,
+                    self.pad_y - point_dy,
+                ),
+            ]
 
             gcmd.respond_info(
-                "Moving CR Touch over strain pad at carriage "
-                "X=%.2f Y=%.2f..."
-                % (probe_x, probe_y))
-
-            toolhead.manual_move(
-                [probe_x, probe_y, None], self.travel_speed)
-            toolhead.wait_moves()
-
-            # Use this Klipper build's native probe API.
-            # run_probe() handles configured samples, tolerance,
-            # retries and averaging, and returns [x, y, z].
-            probe_pos = probe.run_probe(gcmd)
-
-            if probe_pos is None or len(probe_pos) < 3:
-                raise gcmd.error("CR Touch did not return a valid probe result")
-
-            probe_contact_z = probe_pos[2]
-
-            gcmd.respond_info(
-                "CR Touch estimates bed contact at Z=%.4f"
-                % probe_contact_z)
-
-            # Retract before moving the nozzle onto the pad.
-            curpos = toolhead.get_position()
-            retract_z = max(
-                curpos[2] + self.retract_dist,
-                self.clearance_z)
-            toolhead.manual_move([None, None, retract_z], 10.)
-            toolhead.wait_moves()
-
-            # ----------------------------------------------------------
-            # STEP 2: Native MCU strain-gauge measurement at SAME bed point
-            # ----------------------------------------------------------
-            gcmd.respond_info(
-                "Moving nozzle to strain gauge pad at X=%.1f Y=%.1f..."
-                % (self.pad_x, self.pad_y))
-
-            toolhead.manual_move(
-                [self.pad_x, self.pad_y, None],
-                self.travel_speed)
-            toolhead.wait_moves()
+                "Z-compensation point expansion: "
+                "DX=%.3f DY=%.3f mm"
+                % (point_dx, point_dy))
 
             native_speed = gcmd.get_float(
-                "NATIVE_SPEED", 0.50, above=0.0)
+                "NATIVE_SPEED", 1.00, above=0.0)
             search_end_z = gcmd.get_float(
                 "SEARCH_END_Z", 0.0, minval=-0.5, maxval=0.3)
+
+            # trigger_force is retained only for diagnostic reconstruction
+            # of the raw force crossing.  With PRTouch enabled it is not an
+            # MCU motion trigger.
             trigger_force = (
                 self._native_config_helper.get_trigger_force_grams(gcmd))
 
-            strain_contacts = []
-
-            for pass_index in range(3):
-                gcmd.respond_info(
-                    "=== NATIVE STRAIN CONTACT PASS %d/3 ==="
-                    % (pass_index + 1))
-
-                # Start every pass safely above the bed.  The lower Z is
-                # only a search boundary; the load-cell response determines
-                # the measured physical contact height.
-                toolhead.manual_move([None, None, 3.0], 5.0)
-                toolhead.wait_moves()
-
-                pos = toolhead.get_position()
-                pos[2] = search_end_z
-
-                epos, collector = self._native_primitives.probing_move(
-                    self._native_tapping_move,
-                    pos,
-                    native_speed,
-                    gcmd)
-
-                toolhead.flush_step_generation()
-                move_end = toolhead.get_last_move_time()
-                results = collector.collect_until(move_end)
-                samples = load_cell_probe.check_sensor_errors(
-                    results, self.printer)
-
-                trigger_z = epos[2]
-                eventtime = reactor.monotonic()
-                trigger_time = self._native_primitives.get_status(
-                    eventtime)["last_trigger_time"]
-
-                threshold_z, onset_z, fit_count = (
-                    self._analyze_native_contact_samples(
-                        samples,
-                        trigger_time,
-                        trigger_z,
-                        native_speed,
-                        trigger_force))
-
-                if threshold_z is None:
-                    raise gcmd.error(
-                        "Could not determine raw force threshold "
-                        "during native strain calibration")
-
-                strain_contacts.append(threshold_z)
-
-                gcmd.respond_info(
-                    "Native strain pass %d/3:\n"
-                    "  MCU halt Z=%.5f\n"
-                    "  raw %.1fg crossing Z=%.5f\n"
-                    "  onset estimate Z=%s"
-                    % (
-                        pass_index + 1,
-                        trigger_z,
-                        trigger_force,
-                        threshold_z,
-                        ("%.5f" % onset_z)
-                        if onset_z is not None else "N/A"))
-
-                toolhead.manual_move([None, None, 3.0], 5.0)
-                toolhead.wait_moves()
-
-            sorted_contacts = sorted(strain_contacts)
-            nozzle_contact_z = sorted_contacts[1]
+            # Calibration-local CR Touch sampling.  Normal [bltouch]
+            # configuration remains unchanged.
+            probe_params = gcmd.get_command_parameters()
+            probe_params.setdefault("SAMPLES", "3")
+            probe_params.setdefault("SAMPLES_RESULT", "median")
 
             gcmd.respond_info(
-                "Native nozzle strain-gauge median:\n"
-                "  pass 1 = %.5f\n"
-                "  pass 2 = %.5f\n"
-                "  pass 3 = %.5f\n"
-                "  MEDIAN raw %.1fg = %.5f"
+                "Calibration CR Touch sampling: SAMPLES=%s RESULT=%s"
                 % (
-                    strain_contacts[0],
-                    strain_contacts[1],
-                    strain_contacts[2],
-                    trigger_force,
-                    nozzle_contact_z))
+                    probe_params["SAMPLES"],
+                    probe_params["SAMPLES_RESULT"],
+                ))
 
-            # ----------------------------------------------------------
-            # STEP 3: Calculate offset using Klipper PROBE_CALIBRATE math
-            #
-            # new_offset =
-            #     old_offset - nozzle_contact + probe_contact
-            # ----------------------------------------------------------
-            # Match Klipper's native PROBE_CALIBRATE calculation:
-            # z_offset = probe trigger Z - physical nozzle contact Z
-            new_z_offset = probe_contact_z - nozzle_contact_z
+            point_results = []
+
+            for point_index, (point_label, physical_x, physical_y) in enumerate(
+                    calibration_points, start=1):
+
+                probe_x = physical_x - x_offset
+                probe_y = physical_y - y_offset
+
+                gcmd.respond_info(
+                    "=== Z-COMP %s (%d/2) ===\n"
+                    "Physical point: X=%.3f Y=%.3f\n"
+                    "CR Touch carriage: X=%.3f Y=%.3f"
+                    % (
+                        point_label,
+                        point_index,
+                        physical_x,
+                        physical_y,
+                        probe_x,
+                        probe_y,
+                    ))
+
+                # ------------------------------------------------------
+                # CR Touch: measure this exact physical bed point.
+                # ------------------------------------------------------
+                curpos = toolhead.get_position()
+                safe_z = max(curpos[2], self.clearance_z)
+                toolhead.manual_move(
+                    [None, None, safe_z], 10.0)
+                toolhead.wait_moves()
+
+                toolhead.manual_move(
+                    [probe_x, probe_y, None],
+                    self.travel_speed)
+                toolhead.wait_moves()
+
+                probe_pos = probe.run_probe(gcmd)
+
+                if probe_pos is None or len(probe_pos) < 3:
+                    raise gcmd.error(
+                        "CR Touch did not return a valid result at %s"
+                        % point_label)
+
+                cr_touch_z = probe_pos[2]
+
+                gcmd.respond_info(
+                    "%s CR Touch median Z=%.5f"
+                    % (point_label, cr_touch_z))
+
+                # Retract before moving the nozzle onto the same point.
+                curpos = toolhead.get_position()
+                retract_z = max(
+                    curpos[2] + self.retract_dist,
+                    self.clearance_z)
+                toolhead.manual_move(
+                    [None, None, retract_z], 10.0)
+                toolhead.wait_moves()
+
+                # ------------------------------------------------------
+                # PRTouch nozzle contact: 3 contacts, median trigger Z.
+                # ------------------------------------------------------
+                toolhead.manual_move(
+                    [physical_x, physical_y, None],
+                    self.travel_speed)
+                toolhead.wait_moves()
+
+                trigger_contacts = []
+                event_contacts = []
+                raw_crossings = []
+
+                for pass_index in range(3):
+                    gcmd.respond_info(
+                        "=== %s PRTouch PASS %d/3 ==="
+                        % (point_label, pass_index + 1))
+
+                    toolhead.manual_move(
+                        [None, None, 3.0], 5.0)
+                    toolhead.wait_moves()
+
+                    pos = toolhead.get_position()
+                    pos[2] = search_end_z
+
+                    epos, collector = (
+                        self._native_primitives.probing_move(
+                            self._native_tapping_move,
+                            pos,
+                            native_speed,
+                            gcmd))
+
+                    toolhead.flush_step_generation()
+                    move_end = toolhead.get_last_move_time()
+
+                    collected = collector.collect_until(move_end)
+                    samples = load_cell_probe.check_sensor_errors(
+                        collected, self.printer)
+
+                    trigger_z = epos[2]
+
+                    eventtime = reactor.monotonic()
+                    trigger_time = (
+                        self._native_primitives.get_status(
+                            eventtime)["last_trigger_time"])
+
+                    trigger_source = (
+                        self._native_mcu_probe.get_last_trigger_source())
+
+                    if trigger_source != 1:
+                        raise gcmd.error(
+                            "%s pass %d did not trigger from PRTouch "
+                            "(source=%d)"
+                            % (
+                                point_label,
+                                pass_index + 1,
+                                trigger_source,
+                            ))
+
+                    threshold_z, onset_z, fit_count = (
+                        self._analyze_native_contact_samples(
+                            samples,
+                            trigger_time,
+                            trigger_z,
+                            native_speed,
+                            trigger_force))
+
+                    # Use the exact 32-sample MCU PRTouch FIFO that
+                    # caused this trigger.  This replaces the former
+                    # approximation of selecting the last 32 samples
+                    # from Kalico's general host collector.
+                    creality_samples = (
+                        self._native_mcu_probe
+                        .get_last_prtouch_snapshot()
+                    )
+
+                    if len(creality_samples) != 32:
+                        creality_event_z = None
+                        creality_event_count = len(
+                            creality_samples)
+                        creality_event_index = None
+                        creality_before_ms = None
+
+                        gcmd.respond_info(
+                            "%s pass %d/3: frozen MCU PRTouch "
+                            "FIFO unavailable/incomplete "
+                            "(samples=%d, expected=32)"
+                            % (
+                                point_label,
+                                pass_index + 1,
+                                len(creality_samples),
+                            ))
+                    else:
+                        (
+                            creality_event_z,
+                            creality_event_count,
+                            creality_event_index,
+                            creality_before_ms,
+                        ) = self._analyze_creality_contact_event(
+                            creality_samples,
+                            trigger_time,
+                            trigger_z,
+                            native_speed)
+
+                    trigger_contacts.append(trigger_z)
+
+                    if creality_event_z is not None:
+                        event_contacts.append(creality_event_z)
+
+                    if threshold_z is not None:
+                        raw_crossings.append(threshold_z)
+
+                    gcmd.respond_info(
+                        "%s pass %d/3:\n"
+                        "  MCU PRTouch trigger Z=%.5f\n"
+                        "  source=%d(prtouch)\n"
+                        "  Creality event Z=%s\n"
+                        "  event index=%s before trigger=%s\n"
+                        "  raw %.1fg crossing Z=%s\n"
+                        "  onset estimate Z=%s"
+                        % (
+                            point_label,
+                            pass_index + 1,
+                            trigger_z,
+                            trigger_source,
+                            ("%.5f" % creality_event_z)
+                            if creality_event_z is not None else "N/A",
+                            str(creality_event_index)
+                            if creality_event_index is not None else "N/A",
+                            ("%.1fms" % creality_before_ms)
+                            if creality_before_ms is not None else "N/A",
+                            trigger_force,
+                            ("%.5f" % threshold_z)
+                            if threshold_z is not None else "N/A",
+                            ("%.5f" % onset_z)
+                            if onset_z is not None else "N/A",
+                        ))
+
+                    toolhead.manual_move(
+                        [None, None, 3.0], 5.0)
+                    toolhead.wait_moves()
+
+                sorted_triggers = sorted(trigger_contacts)
+                nozzle_trigger_z = sorted_triggers[1]
+
+                point_offset = cr_touch_z - nozzle_trigger_z
+
+                event_median_z = None
+                event_offset = None
+
+                if len(event_contacts) == 3:
+                    sorted_events = sorted(event_contacts)
+                    event_median_z = sorted_events[1]
+                    event_offset = cr_touch_z - event_median_z
+
+                point_results.append({
+                    "label": point_label,
+                    "physical_x": physical_x,
+                    "physical_y": physical_y,
+                    "cr_touch_z": cr_touch_z,
+                    "trigger_contacts": trigger_contacts,
+                    "nozzle_trigger_z": nozzle_trigger_z,
+                    "event_contacts": event_contacts,
+                    "event_median_z": event_median_z,
+                    "event_offset": event_offset,
+                    "raw_crossings": raw_crossings,
+                    "offset": point_offset,
+                })
+
+                gcmd.respond_info(
+                    "%s RESULT:\n"
+                    "  CR Touch Z=%.5f\n"
+                    "  PRTouch triggers: %.5f / %.5f / %.5f\n"
+                    "  PRTouch median Z=%.5f\n"
+                    "  point offset=%.5f"
+                    % (
+                        point_label,
+                        cr_touch_z,
+                        trigger_contacts[0],
+                        trigger_contacts[1],
+                        trigger_contacts[2],
+                        nozzle_trigger_z,
+                        point_offset,
+                    ))
+
+                if event_median_z is None:
+                    gcmd.respond_info(
+                        "%s Creality-event diagnostic: unavailable"
+                        % point_label)
+                else:
+                    gcmd.respond_info(
+                        "%s CREALITY-EVENT DIAGNOSTIC:\n"
+                        "  event Z values: %.5f / %.5f / %.5f\n"
+                        "  event median Z=%.5f\n"
+                        "  event-derived point offset=%.5f"
+                        % (
+                            point_label,
+                            event_contacts[0],
+                            event_contacts[1],
+                            event_contacts[2],
+                            event_median_z,
+                            event_offset,
+                        ))
+
+            if len(point_results) != 2:
+                raise gcmd.error(
+                    "Two-point Z compensation did not complete")
+
+            offset_1 = point_results[0]["offset"]
+            offset_2 = point_results[1]["offset"]
+
+            # Creality combines the two physical point measurements.
+            # tri_expand_mm is intentionally NOT applied yet.  First validate
+            # the two-point measurement and contact definition independently.
+            new_z_offset = (offset_1 + offset_2) / 2.0
+
+            event_offset_1 = point_results[0]["event_offset"]
+            event_offset_2 = point_results[1]["event_offset"]
+
+            if event_offset_1 is not None and event_offset_2 is not None:
+                event_combined = (
+                    event_offset_1 + event_offset_2
+                ) / 2.0
+
+                # Diagnostic only.  This shows what the recovered factory
+                # final math would produce if this reconstructed event
+                # coordinate proves equivalent to Creality cal_tri_data().
+                event_with_tri_expand = event_combined - 0.070
+
+                gcmd.respond_info(
+                    "=== CREALITY-EVENT TWO-POINT DIAGNOSTIC ===\n"
+                    "POINT1 event offset: %.5f\n"
+                    "POINT2 event offset: %.5f\n"
+                    "Event point difference: %.5f\n"
+                    "Event combined average: %.5f\n"
+                    "Event average - 0.070: %.5f\n"
+                    "DIAGNOSTIC ONLY - NOT USED OR STAGED"
+                    % (
+                        event_offset_1,
+                        event_offset_2,
+                        abs(event_offset_1 - event_offset_2),
+                        event_combined,
+                        event_with_tri_expand,
+                    ))
 
             if new_z_offset < 0.:
                 raise gcmd.error(
@@ -582,19 +833,22 @@ class StrainGaugeZCal:
                     % new_z_offset)
 
             gcmd.respond_info(
-                "=== CALIBRATION RESULT ===\n"
-                "CR Touch bed position: %.4f\n"
-                "Nozzle contact position: %.4f\n"
-                "Difference: %.4f\n"
-                "Previous Z offset: %.4f\n"
-                "New Z offset: %.4f\n"
-                "Saving to [%s] z_offset..."
-                % (probe_contact_z,
-                   nozzle_contact_z,
-                   probe_contact_z - nozzle_contact_z,
-                   current_z_offset,
-                   new_z_offset,
-                   self.target_probe_section))
+                "=== TWO-POINT Z-COMP CALIBRATION RESULT ===\n"
+                "POINT1 offset: %.5f\n"
+                "POINT2 offset: %.5f\n"
+                "Point difference: %.5f\n"
+                "Combined average: %.5f\n"
+                "Previous Z offset: %.5f\n"
+                "Proposed Z offset: %.5f\n"
+                "tri_expand_mm: NOT APPLIED"
+                % (
+                    offset_1,
+                    offset_2,
+                    abs(offset_1 - offset_2),
+                    new_z_offset,
+                    current_z_offset,
+                    new_z_offset,
+                ))
 
             if analyze_only:
                 gcmd.respond_info(
@@ -613,6 +867,23 @@ class StrainGaugeZCal:
                     "=== CALIBRATION COMPLETE ===")
 
         finally:
+            if prtouch_thresholds_switched:
+                try:
+                    self._native_mcu_probe.set_prtouch_thresholds(
+                        normal_prtouch_min_hold,
+                        normal_prtouch_max_hold)
+                    gcmd.respond_info(
+                        "Restored normal PRTouch thresholds: min=%d max=%d"
+                        % (
+                            normal_prtouch_min_hold,
+                            normal_prtouch_max_hold,
+                        )
+                    )
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: Could not restore normal PRTouch "
+                        "thresholds: %s" % str(e))
+
             if mesh_was_active and active_profile:
                 try:
                     gcmd.respond_info(
@@ -1470,6 +1741,221 @@ class StrainGaugeZCal:
             "Bed target: 60C\n"
             "Nozzle target: 140C\n"
             "No Z offset or configuration was changed.")
+
+    def cmd_STRAIN_GAUGE_PRT_THRESHOLD_BENCHMARK(self, gcmd):
+        if not self._check_homed():
+            raise gcmd.error("Printer must be homed first! Run G28")
+
+        toolhead = self._get_toolhead()
+        reactor = self.printer.get_reactor()
+
+        speed = gcmd.get_float("SPEED", 1.00, above=0.0)
+        end_z = gcmd.get_float(
+            "END_Z", 0.10, minval=-0.5, maxval=0.3)
+
+        start_z = 3.0
+        retract_z = 5.0
+
+        trigger_force = (
+            self._native_config_helper.get_trigger_force_grams(gcmd))
+
+        normal_min, normal_max = (
+            self._native_mcu_probe.get_prtouch_thresholds()
+        )
+
+        sequence = [
+            ("NORMAL", 1000, 1500),
+            ("ZCOMP", 1400, 2000),
+            ("NORMAL", 1000, 1500),
+            ("ZCOMP", 1400, 2000),
+            ("NORMAL", 1000, 1500),
+            ("ZCOMP", 1400, 2000),
+        ]
+
+        results = []
+
+        gcmd.respond_info(
+            "=== PRTOUCH THRESHOLD A/B BENCHMARK ===\n"
+            "Physical point: X=%.2f Y=%.2f\n"
+            "Speed: %.2f mm/s  END_Z=%.3f\n"
+            "Sequence: 1000/1500 -> 1400/2000 repeated 3 times"
+            % (
+                self.pad_x,
+                self.pad_y,
+                speed,
+                end_z,
+            )
+        )
+
+        # Move to the exact same physical nozzle point for all six contacts.
+        toolhead.manual_move([None, None, retract_z], 5.0)
+        toolhead.wait_moves()
+        toolhead.manual_move(
+            [self.pad_x, self.pad_y, None],
+            self.travel_speed)
+        toolhead.wait_moves()
+
+        try:
+            for run_index, (label, min_hold, max_hold) in enumerate(
+                    sequence, start=1):
+
+                if not self._native_mcu_probe.set_prtouch_thresholds(
+                        min_hold, max_hold):
+                    raise gcmd.error(
+                        "PRTouch waveform triggering is not enabled")
+
+                # Allow the runtime MCU command to be processed before probing.
+                reactor.pause(reactor.monotonic() + 0.05)
+
+                toolhead.manual_move(
+                    [None, None, start_z], 5.0)
+                toolhead.wait_moves()
+
+                pos = toolhead.get_position()
+                pos[2] = end_z
+
+                epos, collector = (
+                    self._native_primitives.probing_move(
+                        self._native_tapping_move,
+                        pos,
+                        speed,
+                        gcmd))
+
+                toolhead.flush_step_generation()
+                move_end = toolhead.get_last_move_time()
+
+                collected = collector.collect_until(move_end)
+                samples = load_cell_probe.check_sensor_errors(
+                    collected, self.printer)
+
+                trigger_z = epos[2]
+
+                eventtime = reactor.monotonic()
+                trigger_time = (
+                    self._native_primitives.get_status(
+                        eventtime)["last_trigger_time"])
+
+                trigger_source = (
+                    self._native_mcu_probe.get_last_trigger_source())
+
+                threshold_z, onset_z, fit_count = (
+                    self._analyze_native_contact_samples(
+                        samples,
+                        trigger_time,
+                        trigger_z,
+                        speed,
+                        trigger_force))
+
+                results.append({
+                    "run": run_index,
+                    "label": label,
+                    "min_hold": min_hold,
+                    "max_hold": max_hold,
+                    "trigger": trigger_z,
+                    "source": trigger_source,
+                    "threshold": threshold_z,
+                })
+
+                source_name = {
+                    1: "prtouch",
+                    2: "force",
+                }.get(trigger_source, "unknown")
+
+                gcmd.respond_info(
+                    "Run %d/6 %-6s %d/%d: "
+                    "MCU trigger=%.5f source=%d(%s) "
+                    "raw %.1fg=%s"
+                    % (
+                        run_index,
+                        label,
+                        min_hold,
+                        max_hold,
+                        trigger_z,
+                        trigger_source,
+                        source_name,
+                        trigger_force,
+                        ("%.5f" % threshold_z)
+                        if threshold_z is not None else "N/A",
+                    )
+                )
+
+                toolhead.manual_move(
+                    [None, None, retract_z], 5.0)
+                toolhead.wait_moves()
+
+                reactor.pause(
+                    reactor.monotonic() + 0.50)
+
+        finally:
+            try:
+                self._native_mcu_probe.set_prtouch_thresholds(
+                    normal_min, normal_max)
+
+                gcmd.respond_info(
+                    "Restored normal PRTouch thresholds: min=%d max=%d"
+                    % (normal_min, normal_max)
+                )
+            except Exception as e:
+                gcmd.respond_info(
+                    "WARNING: Could not restore normal PRTouch "
+                    "thresholds: %s" % str(e))
+
+            if not self.printer.is_shutdown():
+                try:
+                    toolhead.manual_move(
+                        [None, None, retract_z], 5.0)
+                    toolhead.wait_moves()
+                except Exception:
+                    pass
+
+        lines = ["=== PRTOUCH THRESHOLD A/B SUMMARY ==="]
+
+        for label in ["NORMAL", "ZCOMP"]:
+            rows = [
+                row for row in results
+                if row["label"] == label
+            ]
+
+            triggers = [
+                row["trigger"] for row in rows
+                if row["source"] == 1
+            ]
+
+            if triggers:
+                ordered = sorted(triggers)
+                median = ordered[len(ordered) // 2]
+
+                lines.append(
+                    "%-6s MCU trigger: median=%.5f "
+                    "min=%.5f max=%.5f spread=%.5f"
+                    % (
+                        label,
+                        median,
+                        min(triggers),
+                        max(triggers),
+                        max(triggers) - min(triggers),
+                    )
+                )
+            else:
+                lines.append(
+                    "%-6s MCU trigger: no PRTouch-source contacts"
+                    % label
+                )
+
+        # Pair each NORMAL run with the immediately following ZCOMP run.
+        for pair_index in range(3):
+            normal_row = results[pair_index * 2]
+            zcomp_row = results[pair_index * 2 + 1]
+
+            lines.append(
+                "Pair %d ZCOMP-NORMAL trigger delta: %+.5f mm"
+                % (
+                    pair_index + 1,
+                    zcomp_row["trigger"] - normal_row["trigger"],
+                )
+            )
+
+        self.gcode.respond_info("\n".join(lines))
 
     def cmd_STRAIN_GAUGE_NATIVE_BENCHMARK(self, gcmd):
         if not self._check_homed():

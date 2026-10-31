@@ -431,8 +431,10 @@ class McuLoadCellProbe:
         self._config_commands()
         self._home_cmd = None
         self._query_cmd = None
+        self._query_prtouch_sample_cmd = None
         self._set_range_cmd = None
         self._set_prtouch_cmd = None
+        self._last_prtouch_snapshot = []
 
         # Optional Creality-compatible waveform triggering.
         # Default remains normal Kalico force triggering.
@@ -461,6 +463,18 @@ class McuLoadCellProbe:
             oid=self._oid,
             cq=self._cmd_queue,
         )
+        if self._prtouch_enabled:
+            self._query_prtouch_sample_cmd = (
+                self._mcu.lookup_query_command(
+                    "load_cell_probe_query_prtouch_sample"
+                    " oid=%c index=%c",
+                    "load_cell_probe_prtouch_sample"
+                    " oid=%c index=%c valid=%c sample=%i ticks=%u",
+                    oid=self._oid,
+                    cq=self._cmd_queue,
+                )
+            )
+
         self._set_range_cmd = self._mcu.lookup_command(
             "load_cell_probe_set_range"
             " oid=%c safety_counts_min=%i safety_counts_max=%i tare_counts=%i"
@@ -506,6 +520,33 @@ class McuLoadCellProbe:
     def get_dispatch(self):
         return self._dispatch
 
+    def get_prtouch_thresholds(self):
+        return (
+            self._prtouch_min_hold,
+            self._prtouch_max_hold,
+        )
+
+    def set_prtouch_thresholds(self, min_hold: int, max_hold: int):
+        if not self._prtouch_enabled or self._set_prtouch_cmd is None:
+            return False
+        self._set_prtouch_cmd.send(
+            [
+                self._oid,
+                1,
+                min_hold,
+                max_hold,
+            ]
+        )
+        self._prtouch_min_hold = min_hold
+        self._prtouch_max_hold = max_hold
+        return True
+
+    def get_last_trigger_source(self):
+        return getattr(self, "_last_trigger_source", 0)
+
+    def get_last_prtouch_snapshot(self):
+        return list(self._last_prtouch_snapshot)
+
     def set_endstop_range(self, tare_counts: int, gcmd=None):
         # update the load cell so it reflects the new tare value
         self._load_cell.tare(tare_counts)
@@ -541,18 +582,121 @@ class McuLoadCellProbe:
 
     def clear_home(self):
         params = self._query_cmd.send([self._oid])
-        # The time of the first sample that triggered is in "trigger_ticks"
-        trigger_ticks = self._mcu.clock32_to_clock64(params["trigger_ticks"])
+
+        # The MCU trigger timestamp is the newest PRTouch FIFO sample
+        # when trigger_source == 1.
+        trigger_ticks = self._mcu.clock32_to_clock64(
+            params["trigger_ticks"])
         trigger_source = params["trigger_source"]
         self._last_trigger_source = trigger_source
+        self._last_prtouch_snapshot = []
+
         logging.info(
             "load_cell_probe: trigger_source=%d (%s)",
             trigger_source,
-            {1: "prtouch", 2: "force"}.get(trigger_source, "none/unknown"),
+            {1: "prtouch", 2: "force"}.get(
+                trigger_source, "none/unknown"),
         )
-        # clear trsync from load_cell_endstop
-        self._home_cmd.send([self._oid, 0, 0, 0, 0, 0, 0, 0])
-        return self._mcu.clock_to_print_time(trigger_ticks)
+
+        trigger_time = self._mcu.clock_to_print_time(trigger_ticks)
+
+        logging.info(
+            "load_cell_probe: snapshot gate source=%d enabled=%s query_cmd=%s",
+            trigger_source,
+            self._prtouch_enabled,
+            self._query_prtouch_sample_cmd is not None,
+        )
+
+        # Retrieve the exact MCU FIFO BEFORE sending the homing cleanup
+        # command.  The MCU freezes this ring at the PRTouch trigger.
+        #
+        # Cleanup is in finally so a diagnostic query failure can never
+        # leave the MCU probe in its homing state.
+        try:
+            if (
+                trigger_source == 1
+                and self._query_prtouch_sample_cmd is not None
+            ):
+                snapshot = []
+
+                for index in range(32):
+                    sample_params = (
+                        self._query_prtouch_sample_cmd.send(
+                            [self._oid, index])
+                    )
+
+                    if index == 0:
+                        logging.info(
+                            "load_cell_probe: PRTouch FIFO index0 "
+                            "valid=%s sample=%s ticks=%s",
+                            sample_params["valid"],
+                            sample_params["sample"],
+                            sample_params["ticks"],
+                        )
+
+                    if not sample_params["valid"]:
+                        break
+
+                    sample_ticks = self._mcu.clock32_to_clock64(
+                        sample_params["ticks"])
+                    sample_time = self._mcu.clock_to_print_time(
+                        sample_ticks)
+
+                    # Raw HX711 counts relative to the probe tare.
+                    snapshot.append(
+                        (
+                            sample_time,
+                            float(sample_params["sample"]),
+                        )
+                    )
+
+                self._last_prtouch_snapshot = snapshot
+
+                if snapshot:
+                    span_ms = (
+                        snapshot[-1][0] - snapshot[0][0]
+                    ) * 1000.0
+
+                    intervals_ms = [
+                        (
+                            snapshot[i][0]
+                            - snapshot[i - 1][0]
+                        ) * 1000.0
+                        for i in range(1, len(snapshot))
+                    ]
+
+                    median_dt_ms = 0.0
+                    max_dt_ms = 0.0
+
+                    if intervals_ms:
+                        ordered_dt = sorted(intervals_ms)
+                        median_dt_ms = ordered_dt[
+                            len(ordered_dt) // 2]
+                        max_dt_ms = max(intervals_ms)
+
+                    last_gap_ms = (
+                        trigger_time - snapshot[-1][0]
+                    ) * 1000.0
+
+                    logging.info(
+                        "load_cell_probe: frozen PRTouch FIFO "
+                        "samples=%d span=%.1fms "
+                        "median_dt=%.2fms max_dt=%.2fms "
+                        "last_to_trigger=%.2fms",
+                        len(snapshot),
+                        span_ms,
+                        median_dt_ms,
+                        max_dt_ms,
+                        last_gap_ms,
+                    )
+
+        finally:
+            # Clear trsync / homing state only after snapshot retrieval.
+            # Existing MCU cleanup may now reset the ring.
+            self._home_cmd.send(
+                [self._oid, 0, 0, 0, 0, 0, 0, 0])
+
+        return trigger_time
 
 
 # Execute probing moves using the McuLoadCellProbe
