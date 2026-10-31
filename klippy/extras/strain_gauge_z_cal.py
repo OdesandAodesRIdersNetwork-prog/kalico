@@ -372,6 +372,9 @@ class StrainGaugeZCal:
     cmd_CALIBRAR_Z_OFFSET_help = ("Calibrate Z offset using strain gauge "
                                   "at bed corner pad")
     def cmd_CALIBRAR_Z_OFFSET(self, gcmd):
+        return self._run_z_calibration(gcmd)
+
+    def _run_z_calibration(self, gcmd):
         analyze_only = gcmd.get_int('ANALYZE_ONLY', 0, minval=0, maxval=1)
         # Calibrate BLTouch/CR Touch Z offset using the V3 SE strain gauge.
         #
@@ -1502,6 +1505,9 @@ class StrainGaugeZCal:
         )
 
     def cmd_STRAIN_GAUGE_NOZZLE_PREP(self, gcmd):
+        return self._run_nozzle_prep(gcmd)
+
+    def _run_nozzle_prep(self, gcmd):
         if not self._check_homed():
             raise gcmd.error("Printer must be homed first! Run G28")
 
