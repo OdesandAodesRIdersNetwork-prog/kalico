@@ -1579,6 +1579,15 @@ class StrainGaugeZCal:
             trigger_time = self._native_primitives.get_status(
                 eventtime)["last_trigger_time"]
 
+            trigger_source = (
+                self._native_mcu_probe.get_last_trigger_source())
+
+            if trigger_source != 1:
+                raise gcmd.error(
+                    "Wipe-point X%.1f Y%.1f did not trigger from PRTouch "
+                    "(source=%d)"
+                    % (x, y, trigger_source))
+
             threshold_z, onset_z, fit_count = (
                 self._analyze_native_contact_samples(
                     samples,
@@ -1587,13 +1596,25 @@ class StrainGaugeZCal:
                     probe_speed,
                     trigger_force))
 
+            # Production wipe geometry must use the exact frozen 32-sample
+            # MCU PRTouch FIFO that caused the motion trigger.  The general
+            # host collector remains diagnostic only.
+            creality_samples = (
+                self._native_mcu_probe.get_last_prtouch_snapshot())
+
+            if len(creality_samples) != 32:
+                raise gcmd.error(
+                    "Frozen MCU PRTouch FIFO unavailable/incomplete at "
+                    "wipe point X%.1f Y%.1f (samples=%d, expected=32)"
+                    % (x, y, len(creality_samples)))
+
             (
                 creality_z,
                 creality_count,
                 creality_index,
                 creality_before_ms,
             ) = self._analyze_creality_contact_event(
-                samples,
+                creality_samples,
                 trigger_time,
                 trigger_z,
                 probe_speed)
