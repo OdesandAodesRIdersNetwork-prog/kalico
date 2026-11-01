@@ -187,6 +187,7 @@ class E3v3seDisplay:
     select_prepare = select_t()
 
     select_control = select_t()
+    select_leveling = select_t()
     select_axis = select_t()
     select_temp = select_t()
     select_motion = select_t()
@@ -514,6 +515,11 @@ class E3v3seDisplay:
     CONTROL_CASE_INFO = 3
     CONTROL_CASE_TOTAL = 3
 
+    LEVELING_CASE_AUTO_Z = 1
+    LEVELING_CASE_MESH = 2
+    LEVELING_CASE_FULL = 3
+    LEVELING_CASE_TOTAL = 3
+
     TUNE_CASE_SPEED = 1
     TUNE_CASE_TEMP = TUNE_CASE_SPEED + 1
     TUNE_CASE_BED = TUNE_CASE_TEMP + 1
@@ -721,11 +727,10 @@ class E3v3seDisplay:
                     self.index_misc = self.MROWS
                     self.Draw_Misc_Menu()
                 elif self.pd.HAS_ONESTEP_LEVELING:
-                    # The leveling menu is not implemented yet, therefore it popups
-                    # a "feature not available" window
-                    self.popup_caller = self.MainMenu
-                    self.checkkey = self.FeatureNotAvailable
-                    self.Draw_FeatureNotAvailable_Popup()
+                    self.checkkey = self.Leveling
+                    self.select_leveling.reset()
+                    self.index_leveling = self.MROWS
+                    self.Draw_Leveling_Menu()
 
                 else:
                     self.checkkey = self.Info
@@ -1017,6 +1022,36 @@ class E3v3seDisplay:
             if self.select_control.now == self.CONTROL_CASE_INFO:  # Info
                 self.checkkey = self.Info
                 self.Draw_Info_Menu()
+
+    def HMI_Leveling(self):
+        encoder_state = self.get_encoder_state()
+        if encoder_state == self.ENCODER_DIFF_NO:
+            return
+
+        if encoder_state == self.ENCODER_DIFF_CW:
+            if self.select_leveling.inc(1 + self.LEVELING_CASE_TOTAL):
+                self.Move_Highlight(1, self.select_leveling.now)
+
+        elif encoder_state == self.ENCODER_DIFF_CCW:
+            if self.select_leveling.dec():
+                self.Move_Highlight(-1, self.select_leveling.now)
+
+        elif encoder_state == self.ENCODER_DIFF_ENTER:
+            if self.select_leveling.now == 0:
+                self.select_page.set(3)
+                self.Goto_MainMenu()
+
+            elif self.select_leveling.now == self.LEVELING_CASE_AUTO_Z:
+                self.gcode.run_script_from_command("AUTO_Z")
+                self.Goto_MainMenu()
+
+            elif self.select_leveling.now == self.LEVELING_CASE_MESH:
+                self.gcode.run_script_from_command("MESH_LEVEL")
+                self.Goto_MainMenu()
+
+            elif self.select_leveling.now == self.LEVELING_CASE_FULL:
+                self.gcode.run_script_from_command("FULL_CALIBRATE")
+                self.Goto_MainMenu()
 
     def HMI_FeatureNotAvailable(self):
         """
@@ -2959,6 +2994,35 @@ class E3v3seDisplay:
     def Draw_Leveling_Menu(self):
         self.Clear_Main_Window()
 
+        # Draw "Leveling" header
+        self.lcd.draw_icon(
+            False,
+            self.selected_language,
+            self.icon_TEXT_header_leveling,
+            self.HEADER_HEIGHT,
+            1,
+        )
+
+        self.Draw_Back_First(self.select_leveling.now == 0)
+
+        self.Draw_Menu_Line(
+            self.LEVELING_CASE_AUTO_Z,
+            label="Auto Z",
+        )
+        self.Draw_Menu_Line(
+            self.LEVELING_CASE_MESH,
+            label="Mesh Level",
+        )
+        self.Draw_Menu_Line(
+            self.LEVELING_CASE_FULL,
+            label="Full Calibrate",
+        )
+
+        if self.select_leveling.now:
+            self.Draw_Menu_Cursor(self.select_leveling.now)
+
+        self.Draw_Status_Area()
+
     def Draw_Info_Menu(self):
         """
         Draws the "Info" menu on the display.
@@ -4089,6 +4153,8 @@ class E3v3seDisplay:
             self.HMI_Prepare()
         elif self.checkkey == self.Control:
             self.HMI_Control()
+        elif self.checkkey == self.Leveling:
+            self.HMI_Leveling()
         elif self.checkkey == self.PrintProcess:
             self.HMI_Printing()
         elif self.checkkey == self.Print_window:
