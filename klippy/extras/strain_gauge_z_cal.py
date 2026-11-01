@@ -89,6 +89,9 @@ class StrainGaugeZCal:
         # Register gcode commands
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command(
+            'STRAIN_GAUGE_AUTO_Z', self.cmd_STRAIN_GAUGE_AUTO_Z,
+            desc="Run complete V3 SE PRTouch automatic Z calibration")
+        self.gcode.register_command(
             'STRAIN_GAUGE_CALIBRATE_Z', self.cmd_CALIBRAR_Z_OFFSET,
             desc="Calibrate Z offset using strain gauge at bed corner pad")
         self.gcode.register_command(
@@ -368,6 +371,214 @@ class StrainGaugeZCal:
                     "Fine force trace (oldest -> newest):\n%s"
                     % "\n".join(trace_lines))
                 return contact_z
+
+    def cmd_STRAIN_GAUGE_AUTO_Z(self, gcmd):
+        analyze_only = gcmd.get_int(
+            "ANALYZE_ONLY", 0, minval=0, maxval=1)
+
+        # AUTO Z owns the complete linked V3 SE Z-compensation transaction.
+        # The individual nozzle-prep and calibration commands remain
+        # independently callable for diagnostics and development.
+        reactor = self.printer.get_reactor()
+        eventtime = reactor.monotonic()
+        gcode = self.gcode
+
+        # Do not allow an automatic calibration to begin during a print or
+        # while a print is paused.
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is not None:
+            print_state = (
+                print_stats.get_status(eventtime)
+                .get('state', '')
+                .lower())
+            if print_state in ('printing', 'paused'):
+                raise gcmd.error(
+                    "STRAIN_GAUGE_AUTO_Z cannot run while a print is %s"
+                    % print_state)
+
+        # Preserve the active mesh once for the entire linked routine.
+        # AUTO Z clears it before any homing/contact work and restores it
+        # only after the complete sequence finishes.
+        bed_mesh = self.printer.lookup_object('bed_mesh', None)
+        mesh_was_active = False
+        active_profile = ""
+
+        if bed_mesh is not None:
+            mesh_status = bed_mesh.get_status(eventtime)
+            active_profile = mesh_status.get('profile_name', '')
+            mesh_matrix = mesh_status.get('mesh_matrix', [[]])
+            mesh_was_active = bool(mesh_matrix and mesh_matrix[0])
+
+            if mesh_was_active and not active_profile:
+                raise gcmd.error(
+                    "Active bed mesh has no saved profile name. "
+                    "Load a saved mesh profile before running AUTO Z.")
+
+        # Preserve heater targets so a failed AUTO Z can return the printer
+        # to the thermal state it had before the command started.
+        extruder = self.printer.lookup_object('extruder', None)
+        heater_bed = self.printer.lookup_object('heater_bed', None)
+
+        initial_extruder_target = 0.0
+        initial_bed_target = 0.0
+
+        if extruder is not None:
+            initial_extruder_target = (
+                extruder.get_status(eventtime).get('target', 0.0))
+
+        if heater_bed is not None:
+            initial_bed_target = (
+                heater_bed.get_status(eventtime).get('target', 0.0))
+
+        # Creality V3 SE Z compensation uses 1400/2000 for the complete
+        # Z-compensation process, not only the final two-point measurement.
+        cal_prtouch_min_hold = gcmd.get_int(
+            "PRTOUCH_MIN_HOLD", 1400, minval=1)
+        cal_prtouch_max_hold = gcmd.get_int(
+            "PRTOUCH_MAX_HOLD", 2000, minval=1)
+
+        if cal_prtouch_min_hold >= cal_prtouch_max_hold:
+            raise gcmd.error(
+                "PRTOUCH_MIN_HOLD must be less than PRTouch max hold")
+
+        normal_prtouch_min_hold, normal_prtouch_max_hold = (
+            self._native_mcu_probe.get_prtouch_thresholds()
+        )
+
+        prtouch_thresholds_switched = False
+        auto_z_complete = False
+
+        gcmd.respond_info(
+            "=== V3 SE AUTOMATIC Z CALIBRATION ===\n"
+            "Linked factory sequence enabled\n"
+            "Mesh: preserve -> clear -> restore once\n"
+            "PRTouch Z-comp thresholds: min=%d max=%d\n"
+            "ANALYZE_ONLY=%d"
+            % (
+                cal_prtouch_min_hold,
+                cal_prtouch_max_hold,
+                analyze_only,
+            ))
+
+        try:
+            # Establish one mesh-free coordinate system for the complete
+            # factory-style sequence.
+            if mesh_was_active:
+                gcmd.respond_info(
+                    "AUTO Z: clearing bed mesh profile '%s'..."
+                    % active_profile)
+                gcode.run_script_from_command("BED_MESH_CLEAR")
+
+            # Start from a known fully homed machine state.
+            gcmd.respond_info(
+                "AUTO Z: homing printer before nozzle preparation...")
+            gcode.run_script_from_command("G28")
+
+            # Keep the stronger Z-compensation PRTouch thresholds active
+            # continuously through nozzle prep and final calibration.
+            if not self._native_mcu_probe.set_prtouch_thresholds(
+                    cal_prtouch_min_hold,
+                    cal_prtouch_max_hold):
+                raise gcmd.error(
+                    "PRTouch waveform triggering is not enabled")
+
+            prtouch_thresholds_switched = True
+
+            gcmd.respond_info(
+                "AUTO Z: PRTouch thresholds active: min=%d max=%d"
+                % (
+                    cal_prtouch_min_hold,
+                    cal_prtouch_max_hold,
+                ))
+
+            # Complete factory thermal/nozzle preparation.  Because AUTO Z
+            # already cleared the mesh, the standalone helper does not
+            # independently restore a mesh in the middle of the sequence.
+            self._run_nozzle_prep(gcmd)
+
+            # _run_nozzle_prep() finishes at the factory 140C / 60C state
+            # and performs the final G28 Z.  Immediately continue into the
+            # two-point CR Touch + PRTouch measurement while that state is
+            # still intact.
+            gcmd.respond_info(
+                "AUTO Z: nozzle preparation complete; "
+                "starting linked two-point calibration...")
+
+            self._run_z_calibration(gcmd)
+
+            auto_z_complete = True
+
+            if analyze_only:
+                gcmd.respond_info(
+                    "=== AUTO Z ANALYSIS COMPLETE ===\n"
+                    "The complete linked routine ran successfully.\n"
+                    "No Z offset was staged or changed.")
+            else:
+                gcmd.respond_info(
+                    "=== AUTO Z COMPLETE ===\n"
+                    "The calculated Z offset is applied live and staged "
+                    "in the configuration.\n"
+                    "Verify the result, then run SAVE_CONFIG to make it "
+                    "permanent.")
+
+        finally:
+            # Restore the normal PRTouch thresholds exactly once after the
+            # complete linked transaction.
+            if prtouch_thresholds_switched:
+                try:
+                    self._native_mcu_probe.set_prtouch_thresholds(
+                        normal_prtouch_min_hold,
+                        normal_prtouch_max_hold)
+                    gcmd.respond_info(
+                        "AUTO Z: restored normal PRTouch thresholds: "
+                        "min=%d max=%d"
+                        % (
+                            normal_prtouch_min_hold,
+                            normal_prtouch_max_hold,
+                        ))
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: AUTO Z could not restore normal PRTouch "
+                        "thresholds: %s" % str(e))
+
+            # Restore the mesh that was active before AUTO Z.  The mesh is
+            # deliberately not regenerated by Z calibration.
+            if mesh_was_active and active_profile:
+                try:
+                    gcmd.respond_info(
+                        "AUTO Z: restoring bed mesh profile '%s'..."
+                        % active_profile)
+                    gcode.run_script_from_command(
+                        'BED_MESH_PROFILE LOAD="%s"' % active_profile)
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: AUTO Z could not restore bed mesh '%s': %s"
+                        % (active_profile, str(e)))
+
+            # On failure, leave the machine thermally safe and return heater
+            # targets to their pre-AUTO-Z state.  A successful AUTO Z keeps
+            # the factory completion state of 140C nozzle / 60C bed.
+            if not auto_z_complete:
+                try:
+                    gcode.run_script_from_command("M106 S0")
+                except Exception:
+                    pass
+
+                try:
+                    gcode.run_script_from_command(
+                        "M104 S%.1f" % initial_extruder_target)
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: AUTO Z could not restore nozzle target: %s"
+                        % str(e))
+
+                try:
+                    gcode.run_script_from_command(
+                        "M140 S%.1f" % initial_bed_target)
+                except Exception as e:
+                    gcmd.respond_info(
+                        "WARNING: AUTO Z could not restore bed target: %s"
+                        % str(e))
 
     cmd_CALIBRAR_Z_OFFSET_help = ("Calibrate Z offset using strain gauge "
                                   "at bed corner pad")
@@ -1514,12 +1725,27 @@ class StrainGaugeZCal:
         toolhead = self._get_toolhead()
         reactor = self.printer.get_reactor()
 
-        start_x = gcmd.get_float("X", 2.0)
-        start_y = gcmd.get_float("Y", 10.0)
-        wipe_length = gcmd.get_float("LENGTH", 30.0, above=5.0)
+        # Creality factory nozzle-clear geometry:
+        #   configured cleaning region X=0..3, Y=5..55
+        #   choose a random probe start X=0..3, Y=5..25
+        #   probe the second endpoint 30mm farther in Y
+        #   perform the actual wipe 5mm inside each measured endpoint
+        #
+        # Explicit X/Y/LENGTH parameters remain available for diagnostics.
+        start_x = gcmd.get_float(
+            "X", random.uniform(0.0, 3.0))
+        start_y = gcmd.get_float(
+            "Y", random.uniform(5.0, 25.0))
+        wipe_length = gcmd.get_float(
+            "LENGTH", 30.0, above=10.0)
+
         end_y = start_y + wipe_length
 
-        probe_speed = gcmd.get_float("SPEED", 0.50, above=0.0)
+        wipe_inset = 5.0
+        wipe_start_y = start_y + wipe_inset
+        wipe_end_y = end_y - wipe_inset
+
+        probe_speed = gcmd.get_float("SPEED", 1.00, above=0.0)
         search_end_z = gcmd.get_float(
             "SEARCH_END_Z", 0.0, minval=-0.5, maxval=0.3)
         wipe_speed = gcmd.get_float("WIPE_SPEED", 2.0, above=0.0)
@@ -1761,8 +1987,13 @@ class StrainGaugeZCal:
         gcmd.respond_info(
             "=== STRAIN GAUGE NOZZLE PREP ===\n"
             "Bed 60C, nozzle 180C probe, 200C wipe, 140C finish\n"
-            "Wipe line X%.1f Y%.1f -> X%.1f Y%.1f"
-            % (start_x, start_y, start_x, end_y))
+            "Probe line X%.2f Y%.2f -> X%.2f Y%.2f\n"
+            "Wipe line  X%.2f Y%.2f -> X%.2f Y%.2f"
+            % (
+                start_x, start_y,
+                start_x, end_y,
+                start_x, wipe_start_y,
+                start_x, wipe_end_y))
 
         # Creality-style controlled thermal starting state.
         self.gcode.run_script_from_command("M106 S0")
@@ -1886,7 +2117,7 @@ class StrainGaugeZCal:
         toolhead.wait_moves()
 
         toolhead.manual_move(
-            [start_x, start_y, None],
+            [start_x, wipe_start_y, None],
             self.travel_speed)
         toolhead.wait_moves()
 
@@ -1919,9 +2150,12 @@ class StrainGaugeZCal:
             else:
                 self.gcode.run_script_from_command("M83")
 
-        # Factory behavior: one controlled sloped traverse.
+        # Factory behavior: one controlled sloped traverse, beginning
+        # 5mm inside the first measured endpoint and ending 5mm before
+        # the second measured endpoint.  This leaves the measurement
+        # locations themselves outside the rubbing stroke.
         toolhead.manual_move(
-            [start_x, end_y, end_wipe_z],
+            [start_x, wipe_end_y, end_wipe_z],
             wipe_speed)
         toolhead.wait_moves()
 
