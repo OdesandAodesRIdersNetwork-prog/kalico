@@ -145,9 +145,9 @@ class PrinterSerialBridge:
         self.send_serial(msg.encode("utf-8"))
 
     def write(self, msg):
-        # byte_debug = ' '.join(['0x{:02x}'.format(byte) for byte in msg])
-        # self.log("Sending bytes: " + byte_debug)
-        self.serial_bridge_send_cmd.send([self.oid, msg, 4])
+        chunks = self.chunkstring(msg, 40)
+        for chunk in chunks:
+            self.serial_bridge_send_cmd.send([self.oid, chunk, 4])
 
     def send_serial(self, msg):
         if not self._ready:
